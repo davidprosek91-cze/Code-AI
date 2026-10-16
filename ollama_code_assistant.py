@@ -16,11 +16,20 @@ Optimalizace oproti původní verzi:
   - word count přes str.split() bez regexu
   - throttlovaný refresh statistik (0.5 s při streamu, okamžitý po dokončení)
 
+Novinky v této verzi (dlouhé generování):
+  - num_predict = -1 (neomezená délka odpovědi) a větší num_ctx (kontext)
+  - tlačítko „Pokračovat“ – po dokončení odpovědi (nebo při dosažení limitu
+    num_predict / kontextu) umožní poslat modelu výzvu k pokračování
+  - automatická detekce done_reason == "length" → upozornění v status baru
+  - udržování pozice kurzoru (mark) na konci widgetu i pro velmi dlouhé výstupy
+
 Ovládání:
   Ctrl+Enter   odešle požadavek (z pole Vstup)
+  Ctrl+Enter   v režimu pokračování (tlačítko Pokračovat) – pošle výzvu k pokračování
   Ctrl+C       zkopíruje označený text (funguje ve výstupu i ve vstupu)
   Pravé tlačítko myši  kontextové menu
   Tlačítko     Zastavit přeruší běžící generování
+  Tlačítko     Pokračovat pošle modelu výzvu k pokračování tam, kde skončil
 """
 
 from __future__ import annotations
@@ -40,8 +49,31 @@ DEFAULT_HOST = "http://localhost:11434"
 DEFAULT_MODEL = "qwen3.5:0.8b"
 
 SYSTEM_PROMPT = (
-    "Jsi zkušený expert programátor a kopilot v psani kodu."
+    "Jsi zkušený expert programátor a kopilot v psani kodu. "
+    "Když píšeš delší kód, rozděl ho do menších logických bloků. "
+    "Nikdy neříkej, že nemůžeš pokračovat – vždy pokračuj tam, kde jsi skončil."
 )
+
+# Pokyn, který se posílá modelu při stisku tlačítka „Pokračovat“.
+CONTINUE_PROMPT = (
+    "Pokračuj přesně tam, kde jsi skončil. "
+    "Neopakuj již vygenerovaný text ani kód. "
+    "Nepiš žádné úvody ani omluvy – jen navazuj dalším obsahem."
+)
+
+# ---------------------------------------------------------------------------
+# Volby generování – neomezená délka + větší kontextové okno
+# ---------------------------------------------------------------------------
+
+GEN_OPTIONS = {
+    "temperature": 0.7,
+    # -1 = bez limitu (Ollama přestane až na EOS tokenu nebo při zaplnění kontextu)
+    "num_predict": -1,
+    # větší kontextové okno (ve tokenech); zvyšte, pokud máte dost RAM/VRAM
+    "num_ctx": 8192,
+    # ponechat kontext mezi voláními (užitečné pro navazování)
+    "num_keep": 32,
+}
 
 # ---------------------------------------------------------------------------
 # Mapování jazyka bloku kódu na příponu souboru
@@ -242,14 +274,15 @@ class OllamaClient:
     def stream(self, messages, stop_event, on_thinking, on_chunk) -> dict:
         """Postupně volá on_thinking/on_chunk.
 
-        Vrací slovník se statistikami z poslední (hotové) zprávy serveru.
+        Vrací slovník se statistikami z poslední (hotové) zprávy serveru
+        včetně 'done_reason' (např. 'stop' nebo 'length').
         """
         payload = json.dumps(
             {
                 "model": self.model,
                 "messages": messages,
                 "stream": True,
-                "options": {"temperature": 0.7},
+                "options": dict(GEN_OPTIONS),
             }
         ).encode("utf-8")
         req = urllib.request.Request(
@@ -291,6 +324,9 @@ class OllamaClient:
                         val = obj.get(key)
                         if isinstance(val, (int, float)):
                             stats[key] = val
+                    dr = obj.get("done_reason")
+                    if dr:
+                        stats["done_reason"] = dr
                     break
         return stats
 
@@ -333,6 +369,11 @@ class App:
         self._last_stats_update = 0.0
         self._last_perf = 0.0
 
+        # příznak, že poslední odpověď skončila dosažením limitu (length)
+        self._last_done_reason: str = ""
+        # příznak, že běží režim „pokračovat“ (aby se historie nezdvojovala)
+        self._continuing: bool = False
+
         self._build_ui()
         self._update_dir_label()
         self.root.after(self.POLL_MS, self._poll)
@@ -348,6 +389,7 @@ class App:
 
         mono = tkfont.nametofont("TkFixedFont").copy()
         mono.configure(size=11)
+        self._mono = mono
 
         # ---- horní lišta (1. řada: server, model) ------------------------
         bar = ttk.Frame(root, padding=(8, 6))
@@ -424,6 +466,13 @@ class App:
         self.out_text.tag_configure(
             "sys", foreground="#606060", font=("TkFixedFont", 10, "italic")
         )
+        self.out_text.tag_configure(
+            "cont", foreground="#006060", font=("TkFixedFont", 10, "italic")
+        )
+
+        # Značka na konci – pomáhá udržet pozici i při velmi dlouhém výstupu
+        self.out_text.mark_set("end_mark", "end-1c")
+        self.out_text.mark_gravity("end_mark", "right")
 
         # ---- statistika + kopírování (řádek pod textem) ------------------
         srow = ttk.Frame(top)
@@ -470,6 +519,10 @@ class App:
             label="Uložit bloky kódu…", command=self._manual_save_blocks
         )
         self.out_menu.add_command(label="Statistika…", command=self._show_stats)
+        self.out_menu.add_separator()
+        self.out_menu.add_command(
+            label="Pokračovat v generování", command=self._continue_generation
+        )
 
         self.in_menu = tk.Menu(root, tearoff=0)
         self.in_menu.add_command(
@@ -503,6 +556,13 @@ class App:
             foot, text="Zastavit", command=self._stop, state="disabled"
         )
         self.stop_btn.pack(side="left", padx=(6, 0))
+        self.continue_btn = ttk.Button(
+            foot,
+            text="Pokračovat v generování",
+            command=self._continue_generation,
+            state="disabled",
+        )
+        self.continue_btn.pack(side="left", padx=(6, 0))
 
         self.status_var = tk.StringVar(
             value="Připraveno – napište požadavek do vstupu."
@@ -528,18 +588,47 @@ class App:
         self._append("user", f"\n{'─' * 8}\nVSTUP\n{'─' * 8}\n{prompt}\n\n")
         self.history.append({"role": "user", "content": prompt})
         self.in_text.delete("1.0", "end")
+        self._continuing = False
+        self._start_generation()
+
+    # -- pokračování v generování -----------------------------------------
+
+    def _continue_generation(self):
+        """Pošle modelu výzvu k pokračování tam, kde skončil."""
+        if self.worker and self.worker.is_alive():
+            return
+        # Musí existovat předchozí odpověď asistenta
+        if not self.history or self.history[-1]["role"] != "assistant":
+            self.status_var.set("Není co pokračovat – nejprve pošlete dotaz.")
+            return
+
+        self._append(
+            "cont",
+            f"\n{'─' * 8}\nPOKRAČOVÁNÍ\n{'─' * 8}\n{CONTINUE_PROMPT}\n\n",
+        )
+        self.history.append({"role": "user", "content": CONTINUE_PROMPT})
+        self._continuing = True
+        self._start_generation()
+
+    def _start_generation(self):
+        """Spustí worker vlákno s aktuální historií."""
         self.reply_buf = []
         self.stop_event.clear()
         self.thinking_seen = False
         self._stats_fresh = False
+        self._last_done_reason = ""
 
         host = self.host_var.get().strip() or DEFAULT_HOST
         model = self.model_var.get().strip() or DEFAULT_MODEL
         messages = [{"role": "system", "content": SYSTEM_PROMPT}, *self.history]
 
         self.send_btn.configure(state="disabled")
+        self.continue_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
-        self.status_var.set(f"Odesláno modelu {model}…")
+        if self._continuing:
+            self.status_var.set(f"Pokračuji v generování (model {model})…")
+        else:
+            self.status_var.set(f"Odesláno modelu {model}…")
 
         self._last_perf = time.perf_counter()
         self.worker = threading.Thread(
@@ -569,6 +658,8 @@ class App:
                     msg += f" · {stats['eval_count']} tokenů"
                     if tps:
                         msg += f" ({tps:.1f} tok/s)"
+                if stats.get("done_reason") == "length":
+                    msg += " · dosažen limit, lze pokračovat tlačítkem „Pokračovat“"
                 put(("status", msg))
             put(("stats", stats))
         except urllib.error.URLError as e:
@@ -629,6 +720,9 @@ class App:
                     self.last_stats = payload
                     self._stats_fresh = True
                     forced_stats = True
+                    dr = payload.get("done_reason") if isinstance(payload, dict) else None
+                    if dr:
+                        self._last_done_reason = dr
 
                 elif kind == "error":
                     self._append("err", f"\n{payload}\n")
@@ -659,6 +753,15 @@ class App:
                     self.reply_buf = []
                     self.send_btn.configure(state="normal")
                     self.stop_btn.configure(state="disabled")
+                    # Tlačítko Pokračovat zapneme vždy, když existuje odpověď
+                    if self.history and self.history[-1]["role"] == "assistant":
+                        self.continue_btn.configure(state="normal")
+                        if self._last_done_reason == "length":
+                            self._append(
+                                "cont",
+                                "\n[Model dosáhl limitu délky odpovědi – "
+                                "můžete pokračovat tlačítkem „Pokračovat v generování“. ]\n",
+                            )
                     forced_stats = True
 
         except queue.Empty:
@@ -686,6 +789,8 @@ class App:
         at_bottom = self.out_text.yview()[1] >= 0.999
         self.out_text.insert("end", text, "bot")
         if at_bottom:
+            # Pro velmi dlouhé výstupy je see("end") dražší – používejeme mark
+            self.out_text.mark_set("insert", "end-1c")
             self.out_text.see("end")
 
         # inkrementální tracker (žádný full-scan)
@@ -885,6 +990,8 @@ class App:
                     f"Celková doba volání API:  "
                     f"{float(g['total_duration']) / 1e9:.2f} s"
                 )
+            if g.get("done_reason"):
+                lines.append(f"Důvod ukončení:  {g['done_reason']}")
         else:
             lines.append("Zatím žádná odpověď.")
 
@@ -920,6 +1027,10 @@ class App:
             f"Automatické ukládání:  "
             f"{'zapnuto' if self.auto_save_code.get() else 'vypnuto'}",
             f"Uložených souborů v této relaci:  {self.code_counter}",
+            "",
+            "— Generování —",
+            f"num_predict:  {GEN_OPTIONS.get('num_predict')} (=-1 neomezeně)",
+            f"num_ctx:      {GEN_OPTIONS.get('num_ctx')} tokenů",
         ]
 
         messagebox.showinfo(
@@ -942,6 +1053,9 @@ class App:
                        "eval": 0, "prompt_eval": 0}
         self._stats_fresh = False
         self._tracker.reset()          # <-- reset inkrementálního trackeru
+        self._last_done_reason = ""
+        self._continuing = False
+        self.continue_btn.configure(state="disabled")
         self._refresh_stats()
         self.status_var.set("Nový dialog – historie byla smazána.")
 
