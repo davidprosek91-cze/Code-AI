@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ollama kódový asistent – optimalizovaná verze
-==============================================
+Ollama kódový asistent – optimalizovaná verze s reflexí kódu
+============================================================
 GUI aplikace (tkinter) pro psaní dlouhého kódu s lokálním modelem Ollama.
 
   Výchozí server: http://localhost:11434
   Výchozí model:  qwen3.5:0.8b   (obě hodnoty lze změnit v liště nahoře)
 
-Optimalizace oproti původní verzi:
+Optimalizace:
   - inkrementální StatTracker místo O(n) skenu celého výstupu při každém refreshi
   - batchované vkládání chunků do widgetu (1 insert + 1 yview na poll cyklus)
   - queue.SimpleQueue (nižší režie)
@@ -16,20 +16,27 @@ Optimalizace oproti původní verzi:
   - word count přes str.split() bez regexu
   - throttlovaný refresh statistik (0.5 s při streamu, okamžitý po dokončení)
 
-Novinky v této verzi (dlouhé generování):
+Dlouhé generování:
   - num_predict = -1 (neomezená délka odpovědi) a větší num_ctx (kontext)
   - tlačítko „Pokračovat“ – po dokončení odpovědi (nebo při dosažení limitu
     num_predict / kontextu) umožní poslat modelu výzvu k pokračování
   - automatická detekce done_reason == "length" → upozornění v status baru
-  - udržování pozice kurzoru (mark) na konci widgetu i pro velmi dlouhé výstupy
+
+Reflexe kódu (novinka):
+  - Volitelně lze zapnout „Reflexe kódu každých N řádků“.
+  - Během psaní kódu aplikace po každých N řádcích zastaví stream, pošle
+    modelu krátkou výzvu, aby se zamyslel nad možnými problémy v právě
+    napsaném kódu (chyby, edge-cases, vylepšení), a pak automaticky
+    pokračuje v generování se zohledněním této reflexe.
+  - Reflexe se zobrazují odlišeným stylem (tyrkysová kurzíva) a jsou
+    součástí historie dialogu, takže zvyšují kvalitu dalšího pokračování.
 
 Ovládání:
   Ctrl+Enter   odešle požadavek (z pole Vstup)
-  Ctrl+Enter   v režimu pokračování (tlačítko Pokračovat) – pošle výzvu k pokračování
   Ctrl+C       zkopíruje označený text (funguje ve výstupu i ve vstupu)
   Pravé tlačítko myši  kontextové menu
   Tlačítko     Zastavit přeruší běžící generování
-  Tlačítko     Pokračovat pošle modelu výzvu k pokračování tam, kde skončil
+  Tlačítko     Pokračovat v generování – pošle modelu výzvu k pokračování
 """
 
 from __future__ import annotations
@@ -59,6 +66,22 @@ CONTINUE_PROMPT = (
     "Pokračuj přesně tam, kde jsi skončil. "
     "Neopakuj již vygenerovaný text ani kód. "
     "Nepiš žádné úvody ani omluvy – jen navazuj dalším obsahem."
+)
+
+# Pokyn pro reflexi – posílá se automaticky po každých N řádcích kódu.
+REFLECT_PROMPT_TEMPLATE = (
+    "Právě jsi napsal přibližně {n} řádků kódu/textu. "
+    "Zamysli se KRÁTCE (2–4 věty) nad možnými problémy v tom, co jsi právě "
+    "napsal – konkrétně: chyby, edge-cases, bezpečnostní problémy, "
+    "nedostatečné ošetření vstupů, špatná architektura nebo vylepšení. "
+    "Buď konkrétní a věcný. Neopakuj kód. "
+    "Nakonec napiš 'POKRAČUJI:' a nic dalšího."
+)
+
+# Pokyn pro pokračování po reflexi – explicitně říkáme, ať nezahajuje znovu.
+REFLECT_CONTINUE_PROMPT = (
+    "Pokračuj PŘESNĚ tam, kde jsi skončil – uprostřed kódu, ne od začátku. "
+    "Zohledni svou předchozí reflexi. Nepiš znovu to, co už je napsané."
 )
 
 # ---------------------------------------------------------------------------
@@ -195,11 +218,7 @@ def analyze_text(content: str) -> dict:
 # ---------------------------------------------------------------------------
 
 class StatTracker:
-    """Sleduje znaky/slova/řádky/bloky přírůstkově, jak přicházejí chunky.
-
-    Umožňuje zobrazovat živou statistiku bez opakovaného skenování celého
-    textu widgetu (což je u dlouhých výstupů výrazně dražší).
-    """
+    """Sleduje znaky/slova/řádky/bloky přírůstkově, jak přicházejí chunky."""
 
     __slots__ = (
         "chars", "words", "newlines", "blocks", "langs",
@@ -215,24 +234,20 @@ class StatTracker:
         self.newlines = 0
         self.blocks = 0
         self.langs: dict[str, int] = {}
-        self._last_was_space = True   # byl poslední znak bílé místo?
-        self._in_block = False        # jsme uvnitř ``` bloku?
-        self._partial = ""            # nedokončený řádek (bez \n na konci)
+        self._last_was_space = True
+        self._in_block = False
+        self._partial = ""
 
     def feed(self, text: str) -> None:
         if not text:
             return
-
         self.chars += len(text)
-
-        # --- slova (přes C-optimized str.split) ---
         wc = len(text.split())
         if wc and not self._last_was_space and not text[0].isspace():
-            wc -= 1  # první „slovo" navazuje na předchozí chunk
+            wc -= 1
         self.words += wc
         self._last_was_space = text[-1].isspace()
 
-        # --- řádky + fence ``` ---
         if "\n" in text:
             combined = self._partial + text
             parts = combined.split("\n")
@@ -255,7 +270,6 @@ class StatTracker:
                 self.langs[lang] = self.langs.get(lang, 0) + 1
 
     def snapshot(self) -> tuple[int, int, int, int, dict[str, int]]:
-        """Vrátí (chars, words, lines, blocks, langs) jako jednorázový snapshot."""
         lines = self.newlines + (1 if self.chars else 0)
         return self.chars, self.words, lines, self.blocks, self.langs
 
@@ -337,14 +351,16 @@ class OllamaClient:
 
 class App:
     POLL_MS = 60
-    STATS_THROTTLE = 0.5   # s – jak často obnovovat řádek statistik při streamu
+    STATS_THROTTLE = 0.5          # s – jak často obnovovat řádek statistik při streamu
+    MAX_REFLECTION_CYCLES = 50    # bezpečnostní limit, aby se nezacyklilo
 
     def __init__(self, root: tk.Tk):
         self.root = root
         self.history: list[dict] = []
         self.reply_buf: list[str] = []
         self.last_reply_text: str = ""
-        self.stop_event = threading.Event()
+        self.stop_event = threading.Event()   # vnitřní – může být nastaven i námi
+        self.user_stop = threading.Event()    # pouze uživatelský STOP
         self.worker: threading.Thread | None = None
         self.q: queue.SimpleQueue = queue.SimpleQueue()
         self.show_thinking = tk.BooleanVar(value=False)
@@ -355,6 +371,11 @@ class App:
         self.dir_label_var = tk.StringVar()
         self.code_counter = 0
 
+        # reflexe kódu
+        self.reflect_enabled = tk.BooleanVar(value=False)
+        self.reflect_every = tk.IntVar(value=10)
+        self._reflection_count = 0
+
         # statistika
         self.last_stats: dict = {}
         self.totals: dict = {
@@ -363,16 +384,18 @@ class App:
             "gen_s": 0.0,
             "eval": 0,
             "prompt_eval": 0,
+            "reflections": 0,
         }
         self._stats_fresh = False
         self._tracker = StatTracker()
         self._last_stats_update = 0.0
         self._last_perf = 0.0
 
-        # příznak, že poslední odpověď skončila dosažením limitu (length)
+        # stavové příznaky
         self._last_done_reason: str = ""
-        # příznak, že běží režim „pokračovat“ (aby se historie nezdvojovala)
         self._continuing: bool = False
+        self._reflective_active: bool = False
+        self._got_final_history: bool = False
 
         self._build_ui()
         self._update_dir_label()
@@ -383,8 +406,8 @@ class App:
     def _build_ui(self):
         root = self.root
         root.title(f"Ollama kódový asistent – {DEFAULT_MODEL}")
-        root.geometry("1040x760")
-        root.minsize(720, 480)
+        root.geometry("1040x780")
+        root.minsize(720, 500)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         mono = tkfont.nametofont("TkFixedFont").copy()
@@ -419,7 +442,7 @@ class App:
         )
 
         # ---- horní lišta (2. řada: ukládání bloků kódu) ------------------
-        bar2 = ttk.Frame(root, padding=(8, 0, 8, 6))
+        bar2 = ttk.Frame(root, padding=(8, 0, 8, 4))
         bar2.pack(side="top", fill="x")
 
         ttk.Checkbutton(
@@ -438,6 +461,31 @@ class App:
         ttk.Label(
             bar2, textvariable=self.dir_label_var, foreground="#606060"
         ).pack(side="left", padx=(8, 0))
+
+        # ---- horní lišta (3. řada: reflexe kódu) -------------------------
+        bar3 = ttk.Frame(root, padding=(8, 0, 8, 6))
+        bar3.pack(side="top", fill="x")
+
+        ttk.Checkbutton(
+            bar3,
+            text="Reflexe kódu každých",
+            variable=self.reflect_enabled,
+        ).pack(side="left")
+
+        spin = ttk.Spinbox(
+            bar3,
+            from_=3, to=50, increment=1,
+            textvariable=self.reflect_every,
+            width=4,
+        )
+        spin.pack(side="left", padx=(4, 4))
+
+        ttk.Label(
+            bar3,
+            text="řádků (model se krátce zamyslí nad problémy v kódu, "
+                 "čímž zvýší kvalitu dalšího pokračování)",
+            foreground="#505050",
+        ).pack(side="left")
 
         # ---- dělicí okno: výstup nahoře, vstup dole ----------------------
         paned = ttk.Panedwindow(root, orient="vertical")
@@ -468,6 +516,19 @@ class App:
         )
         self.out_text.tag_configure(
             "cont", foreground="#006060", font=("TkFixedFont", 10, "italic")
+        )
+        # Reflexe – výrazný tyrkysový blok
+        self.out_text.tag_configure(
+            "reflect", foreground="#006b6b",
+            font=("TkFixedFont", 10, "italic"),
+            background="#eaf6f6",
+            spacing1=2, spacing3=2, lmargin1=12, lmargin2=12,
+        )
+        self.out_text.tag_configure(
+            "reflect_head", foreground="#005050",
+            font=("TkFixedFont", 10, "bold italic"),
+            background="#d8efef",
+            spacing1=4, spacing3=2, lmargin1=6, lmargin2=6,
         )
 
         # Značka na konci – pomáhá udržet pozici i při velmi dlouhém výstupu
@@ -539,7 +600,6 @@ class App:
         )
         self.in_menu.add_command(label="Odeslat    Ctrl+Enter", command=self._send)
 
-        # zkratky a menu i ve výstupu/vstupu
         for w in (self.out_text, self.in_text):
             w.bind("<Control-c>", self._on_copy_key)
             w.bind("<Control-C>", self._on_copy_key)
@@ -597,7 +657,6 @@ class App:
         """Pošle modelu výzvu k pokračování tam, kde skončil."""
         if self.worker and self.worker.is_alive():
             return
-        # Musí existovat předchozí odpověď asistenta
         if not self.history or self.history[-1]["role"] != "assistant":
             self.status_var.set("Není co pokračovat – nejprve pošlete dotaz.")
             return
@@ -614,9 +673,13 @@ class App:
         """Spustí worker vlákno s aktuální historií."""
         self.reply_buf = []
         self.stop_event.clear()
+        self.user_stop.clear()
         self.thinking_seen = False
         self._stats_fresh = False
         self._last_done_reason = ""
+        self._reflective_active = self.reflect_enabled.get()
+        self._got_final_history = False
+        self._reflection_count = 0
 
         host = self.host_var.get().strip() or DEFAULT_HOST
         model = self.model_var.get().strip() or DEFAULT_MODEL
@@ -625,7 +688,12 @@ class App:
         self.send_btn.configure(state="disabled")
         self.continue_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
-        if self._continuing:
+        if self._reflective_active:
+            self.status_var.set(
+                f"Odesláno modelu {model} (reflexe každých "
+                f"{max(3, int(self.reflect_every.get() or 10))} řádků)…"
+            )
+        elif self._continuing:
             self.status_var.set(f"Pokračuji v generování (model {model})…")
         else:
             self.status_var.set(f"Odesláno modelu {model}…")
@@ -637,8 +705,19 @@ class App:
         self.worker.start()
 
     def _run(self, host: str, model: str, messages):
+        """Dispatch: buď jednoduché generování, nebo reflexní režim."""
+        if self._reflective_active:
+            self._run_reflective(host, model, messages)
+        else:
+            self._run_simple(host, model, messages)
+
+    # ------------------------------------------------------------------
+    # Jednoduché (původní) generování
+    # ------------------------------------------------------------------
+
+    def _run_simple(self, host: str, model: str, messages):
         t0 = time.perf_counter()
-        put = self.q.put  # lokální reference (mikro-optimalizace)
+        put = self.q.put
         try:
             client = OllamaClient(host, model)
             raw_stats = client.stream(
@@ -649,7 +728,7 @@ class App:
             )
             stats = dict(raw_stats or {})
             stats["gen_s"] = time.perf_counter() - t0
-            if self.stop_event.is_set():
+            if self.user_stop.is_set():
                 put(("status", f"Generování zastaveno po {stats['gen_s']:.1f} s."))
             else:
                 msg = f"Hotovo · {stats['gen_s']:.1f} s"
@@ -670,6 +749,153 @@ class App:
         finally:
             put(("finished", None))
 
+    # ------------------------------------------------------------------
+    # Reflexní generování – více cyklů s pauzami na reflexi
+    # ------------------------------------------------------------------
+
+    def _run_reflective(self, host: str, model: str, messages):
+        """
+        Vícefázové generování:
+          1. Streamuj obsah, dokud neuplyne ~N řádků (počítáno podle \n).
+          2. Zastav stream, přidej vygenerovaný text jako assistant zprávu.
+          3. Pošli modelu výzvu k reflexi (chyby, edge-cases, vylepšení).
+          4. Streamuj krátkou reflexi (zobrazí se odlišeným stylem).
+          5. Přidej reflexi do historie a pošli pokyn k pokračování.
+          6. Opakuj, dokud model sám neskončí nebo uživatel nezastaví.
+        """
+        t0 = time.perf_counter()
+        put = self.q.put
+        client = OllamaClient(host, model)
+
+        try:
+            line_limit = max(3, int(self.reflect_every.get() or 10))
+        except (tk.TclError, ValueError):
+            line_limit = 10
+
+        conv = list(messages)          # pracovní kopie historie (se systémem)
+        all_main_chars: list[str] = [] # veškerý hlavní obsah (bez reflexí)
+        all_stats: dict = {}
+        cycle = 0
+
+        try:
+            while cycle < self.MAX_REFLECTION_CYCLES:
+                if self.user_stop.is_set():
+                    break
+                cycle += 1
+                self.stop_event.clear()
+
+                cycle_chars: list[str] = []
+                cycle_lines = [0]
+                aborted_by_limit = [False]
+                first_chunk = [True]
+
+                def on_chunk(c, _cycle=cycle):
+                    cycle_chars.append(c)
+                    all_main_chars.append(c)
+                    cycle_lines[0] += c.count("\n")
+                    if first_chunk[0]:
+                        put(("status", f"Generuji kód (cyklus {_cycle})…"))
+                        first_chunk[0] = False
+                    put(("chunk", c))
+                    if cycle_lines[0] >= line_limit:
+                        aborted_by_limit[0] = True
+                        self.stop_event.set()
+
+                try:
+                    stats = client.stream(
+                        conv, self.stop_event,
+                        lambda t: put(("thinking", t)),
+                        on_chunk,
+                    )
+                    all_stats = stats
+                except urllib.error.URLError as e:
+                    put(("error", f"Chyba spojení se serverem {host}: {e.reason}\n"
+                                  "Zkontrolujte, zda běží `ollama serve`."))
+                    break
+                except Exception as e:  # noqa: BLE001
+                    put(("error", f"Chyba: {e}"))
+                    break
+
+                cycle_text = "".join(cycle_chars)
+                if cycle_text:
+                    conv.append({"role": "assistant", "content": cycle_text})
+
+                if self.user_stop.is_set() and not aborted_by_limit[0]:
+                    break
+
+                if not aborted_by_limit[0]:
+                    # Přirozený konec – model sám dokončil
+                    break
+
+                # ---------- REFLEXNÍ FÁZE ----------
+                self._reflection_count += 1
+                put(("reflection_start", self._reflection_count))
+
+                reflect_prompt = REFLECT_PROMPT_TEMPLATE.format(n=line_limit)
+                conv.append({"role": "user", "content": reflect_prompt})
+
+                self.stop_event.clear()
+                refl_chars: list[str] = []
+
+                def on_refl(c):
+                    refl_chars.append(c)
+                    put(("reflection", c))
+
+                try:
+                    client.stream(
+                        conv, self.stop_event,
+                        lambda t: None,
+                        on_refl,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    put(("error", f"Chyba při reflexi: {e}"))
+                    break
+
+                reflection_text = "".join(refl_chars)
+                if reflection_text:
+                    conv.append({"role": "assistant", "content": reflection_text})
+
+                put(("reflection_end", self._reflection_count))
+
+                if self.user_stop.is_set():
+                    break
+
+                # ---------- POKRAČOVÁNÍ ----------
+                conv.append({"role": "user", "content": REFLECT_CONTINUE_PROMPT})
+                # malá pauza, ať server stihne uzavřít předchozí spojení
+                time.sleep(0.05)
+
+            # konec cyklu
+        finally:
+            gen_s = time.perf_counter() - t0
+            stats_out = dict(all_stats or {})
+            stats_out["gen_s"] = gen_s
+            if self._reflection_count:
+                stats_out["reflections"] = self._reflection_count
+
+            # finální obsah (jen hlavní, bez reflexí) a historie
+            final_main = "".join(all_main_chars)
+            put(("final_main_content", final_main))
+            put(("final_history", [m for m in conv[1:]]))  # bez systémové zprávy
+
+            if self.user_stop.is_set():
+                put(("status", f"Zastaveno po {gen_s:.1f} s."))
+            else:
+                msg = f"Hotovo · {gen_s:.1f} s"
+                tps = self._toks_per_s(stats_out)
+                if stats_out.get("eval_count"):
+                    msg += f" · {stats_out['eval_count']} tokenů"
+                    if tps:
+                        msg += f" ({tps:.1f} tok/s)"
+                if self._reflection_count:
+                    msg += f" · reflexí: {self._reflection_count}"
+                if stats_out.get("done_reason") == "length":
+                    msg += " · dosažen limit, lze pokračovat"
+                put(("status", msg))
+
+            put(("stats", stats_out))
+            put(("finished", None))
+
     @staticmethod
     def _toks_per_s(stats: dict) -> float:
         """Rychlost generování v Tok/s (eval_count / eval_duration)."""
@@ -681,6 +907,7 @@ class App:
 
     def _stop(self):
         if self.worker and self.worker.is_alive():
+            self.user_stop.set()
             self.stop_event.set()
             self.status_var.set("Zastavuji…")
 
@@ -689,6 +916,7 @@ class App:
     def _poll(self):
         q_get = self.q.get_nowait
         chunk_buf: list[str] = []
+        refl_buf: list[str] = []
         forced_stats = False
 
         try:
@@ -699,10 +927,20 @@ class App:
                     chunk_buf.append(payload)
                     continue
 
-                # vyprázdnit nasbírané chunky před zpracováním jiné zprávy
+                if kind == "reflection":
+                    if chunk_buf:
+                        self._flush_chunks(chunk_buf)
+                        chunk_buf = []
+                    refl_buf.append(payload)
+                    continue
+
+                # vyprázdnit nasbírané buffery před zpracováním jiné zprávy
                 if chunk_buf:
                     self._flush_chunks(chunk_buf)
                     chunk_buf = []
+                if refl_buf:
+                    self._flush_reflection(refl_buf)
+                    refl_buf = []
 
                 if kind == "thinking":
                     if self.show_thinking.get():
@@ -712,6 +950,18 @@ class App:
                     elif not self.thinking_seen:
                         self.status_var.set("Model přemýšlí…")
                     self.thinking_seen = True
+
+                elif kind == "reflection_start":
+                    n = payload
+                    self._append(
+                        "reflect_head",
+                        f"\n◆ Reflexe kódu č. {n} — zamýšlím se nad kvalitou…\n",
+                    )
+                    self.status_var.set(f"Reflexe kódu č. {n}…")
+
+                elif kind == "reflection_end":
+                    self._append("reflect_head", "\n— konec reflexe —\n\n")
+                    self.status_var.set("Pokračuji v generování…")
 
                 elif kind == "status":
                     self.status_var.set(payload)
@@ -724,36 +974,66 @@ class App:
                     if dr:
                         self._last_done_reason = dr
 
+                elif kind == "final_main_content":
+                    # Uložíme hlavní obsah pro ukládání bloků (bez reflexí).
+                    self.last_reply_text = payload or ""
+
+                elif kind == "final_history":
+                    # Nahradíme historii dialogu tou, kterou sestavil worker.
+                    self._got_final_history = True
+                    self.history = list(payload or [])
+
                 elif kind == "error":
                     self._append("err", f"\n{payload}\n")
                     self.status_var.set("Chyba – viz výstup.")
                     forced_stats = True
 
                 elif kind == "finished":
-                    if self.reply_buf:
-                        content = "".join(self.reply_buf)
-                        self.history.append(
-                            {"role": "assistant", "content": content}
-                        )
-                        self.last_reply_text = content
+                    if not self._got_final_history:
+                        # klasický (nereflexní) režim – chováme se jako dřív
+                        if self.reply_buf:
+                            content = "".join(self.reply_buf)
+                            self.history.append(
+                                {"role": "assistant", "content": content}
+                            )
+                            self.last_reply_text = content
+                            if self._stats_fresh:
+                                g = self.last_stats
+                                self.totals["replies"] += 1
+                                self.totals["reply_chars"] += len(content)
+                                self.totals["gen_s"] += float(g.get("gen_s") or 0.0)
+                                self.totals["eval"] += int(g.get("eval_count") or 0)
+                                self.totals["prompt_eval"] += int(
+                                    g.get("prompt_eval_count") or 0
+                                )
+                            self._stats_fresh = False
+
+                            if self.auto_save_code.get():
+                                self._save_blocks_from_text(content, auto=True)
+                    else:
+                        # reflexní režim – statistiky + ukládání bloků
                         if self._stats_fresh:
                             g = self.last_stats
                             self.totals["replies"] += 1
-                            self.totals["reply_chars"] += len(content)
+                            self.totals["reply_chars"] += len(self.last_reply_text)
                             self.totals["gen_s"] += float(g.get("gen_s") or 0.0)
                             self.totals["eval"] += int(g.get("eval_count") or 0)
                             self.totals["prompt_eval"] += int(
                                 g.get("prompt_eval_count") or 0
                             )
+                            self.totals["reflections"] += int(
+                                g.get("reflections") or 0
+                            )
                         self._stats_fresh = False
 
-                        if self.auto_save_code.get():
-                            self._save_blocks_from_text(content, auto=True)
+                        if self.auto_save_code.get() and self.last_reply_text:
+                            self._save_blocks_from_text(
+                                self.last_reply_text, auto=True
+                            )
 
                     self.reply_buf = []
                     self.send_btn.configure(state="normal")
                     self.stop_btn.configure(state="disabled")
-                    # Tlačítko Pokračovat zapneme vždy, když existuje odpověď
                     if self.history and self.history[-1]["role"] == "assistant":
                         self.continue_btn.configure(state="normal")
                         if self._last_done_reason == "length":
@@ -769,11 +1049,14 @@ class App:
 
         if chunk_buf:
             self._flush_chunks(chunk_buf)
+        if refl_buf:
+            self._flush_reflection(refl_buf)
 
         # --- throttlovaný refresh statistik ---
         now = time.monotonic()
         if forced_stats or (
-            chunk_buf and now - self._last_stats_update >= self.STATS_THROTTLE
+            (chunk_buf or refl_buf)
+            and now - self._last_stats_update >= self.STATS_THROTTLE
         ):
             self._refresh_stats()
             self._last_stats_update = now
@@ -785,17 +1068,25 @@ class App:
         text = "".join(chunks)
         self.reply_buf.append(text)
 
-        # detekce, zda uživatel je na konci (1 yview call místo N)
         at_bottom = self.out_text.yview()[1] >= 0.999
         self.out_text.insert("end", text, "bot")
         if at_bottom:
-            # Pro velmi dlouhé výstupy je see("end") dražší – používejeme mark
             self.out_text.mark_set("insert", "end-1c")
             self.out_text.see("end")
 
-        # inkrementální tracker (žádný full-scan)
         self._tracker.feed(text)
-        self.status_var.set("Generuji odpověď…")
+        if not self._reflective_active:
+            self.status_var.set("Generuji odpověď…")
+
+    def _flush_reflection(self, chunks: list[str]):
+        """Vloží nasbírané chunk(y) reflexe odlišeným stylem."""
+        text = "".join(chunks)
+        at_bottom = self.out_text.yview()[1] >= 0.999
+        self.out_text.insert("end", text, "reflect")
+        if at_bottom:
+            self.out_text.mark_set("insert", "end-1c")
+            self.out_text.see("end")
+        self._tracker.feed(text)
 
     # -- pomocné akce ------------------------------------------------------
 
@@ -941,6 +1232,8 @@ class App:
             f"Řádky {lines}",
             f"Bloků kódu {blocks}",
         ]
+        if self._reflection_count:
+            parts.append(f"Reflexí {self._reflection_count}")
         g = self.last_stats
         if g.get("eval_count") or g.get("gen_s"):
             seg = f"Poslední odpověď {float(g.get('gen_s') or 0):.1f} s"
@@ -992,6 +1285,8 @@ class App:
                 )
             if g.get("done_reason"):
                 lines.append(f"Důvod ukončení:  {g['done_reason']}")
+            if g.get("reflections"):
+                lines.append(f"Provedených reflexí:  {g['reflections']}")
         else:
             lines.append("Zatím žádná odpověď.")
 
@@ -1015,6 +1310,8 @@ class App:
             f"Tokeny odpovědí celkem:  {t['eval']}   "
             f"Vstupní tokeny celkem:  {t['prompt_eval']}",
         ]
+        if t.get("reflections"):
+            lines.append(f"Provedených reflexí celkem:  {t['reflections']}")
         if t["replies"] and t["gen_s"]:
             lines.append(
                 f"Průměr na odpověď:  {t['gen_s'] / t['replies']:.1f} s, "
@@ -1031,6 +1328,8 @@ class App:
             "— Generování —",
             f"num_predict:  {GEN_OPTIONS.get('num_predict')} (=-1 neomezeně)",
             f"num_ctx:      {GEN_OPTIONS.get('num_ctx')} tokenů",
+            f"Reflexe kódu: "
+            f"{'zapnuta, každých ' + str(self.reflect_every.get()) + ' řádků' if self.reflect_enabled.get() else 'vypnuta'}",
         ]
 
         messagebox.showinfo(
@@ -1050,11 +1349,12 @@ class App:
         self.last_reply_text = ""
         self.last_stats = {}
         self.totals = {"replies": 0, "reply_chars": 0, "gen_s": 0.0,
-                       "eval": 0, "prompt_eval": 0}
+                       "eval": 0, "prompt_eval": 0, "reflections": 0}
         self._stats_fresh = False
-        self._tracker.reset()          # <-- reset inkrementálního trackeru
+        self._tracker.reset()
         self._last_done_reason = ""
         self._continuing = False
+        self._reflection_count = 0
         self.continue_btn.configure(state="disabled")
         self._refresh_stats()
         self.status_var.set("Nový dialog – historie byla smazána.")
@@ -1081,6 +1381,7 @@ class App:
             messagebox.showerror("Chyba ukládání", str(e), parent=self.root)
 
     def _on_close(self):
+        self.user_stop.set()
         self.stop_event.set()
         self.root.destroy()
 
