@@ -22,6 +22,11 @@ Statistika:
   tlačítko Statistika…  detailní přehled: tokeny a doby z Ollamy, jazyky kódu,
                         kumulativní součty celého dialogu
 
+Bloky kódu:
+  Bloky ```…``` z odpovědí modelu se ukládají jako samostatné soubory
+  do zvolené složky (výchozí = aktuální pracovní složka).
+  Automatické ukládání lze vypnout zaškrtávátkem v liště.
+
 Vyžaduje běžící `ollama serve` a stažený model:
   ollama pull qwen3.5:0.8b
 """
@@ -29,7 +34,9 @@ Vyžaduje běžící `ollama serve` a stažený model:
 from __future__ import annotations
 
 import json
+import os
 import queue
+import re
 import threading
 import time
 import urllib.error
@@ -42,13 +49,97 @@ DEFAULT_HOST = "http://localhost:11434"
 DEFAULT_MODEL = "qwen3.5:0.8b"
 
 SYSTEM_PROMPT = (
-    "Jsi zkušený senior programátor a asistent pro psaní kódu. "
-    "Při psaní dlouhého kódu se vždy řiď těmito pravidly: "
-    "1) uváděj kompletní, funkční a spustitelný kód – žádné výňatky, zkratky ani \"...\"; "
-    "2) kód vkládej do bloků označených trojmi vlnovkou s uvedením jazyka (např. ```python); "
-    "3) drž se jazyka a stylu, které používá uživatel; "
-    "4) mimo kód buď stručný a kreativní; pokud je zadání neúplné, napiš co nejméně doplňujících otázek a navrhni rozumné výchozí řešení."
+    "Jsi zkušený expert programátor a kopilot v psani kodu."
 )
+
+# ---------------------------------------------------------------------------
+# Mapování jazyka bloku kódu na příponu souboru
+# ---------------------------------------------------------------------------
+
+LANG_EXT = {
+    "python": ".py", "py": ".py", "python3": ".py",
+    "javascript": ".js", "js": ".js", "node": ".js",
+    "typescript": ".ts", "ts": ".ts",
+    "jsx": ".jsx", "tsx": ".tsx",
+    "html": ".html", "htm": ".html",
+    "css": ".css", "scss": ".scss", "sass": ".sass", "less": ".less",
+    "json": ".json", "json5": ".json5",
+    "yaml": ".yaml", "yml": ".yaml",
+    "toml": ".toml", "ini": ".ini", "cfg": ".cfg",
+    "xml": ".xml", "svg": ".svg",
+    "markdown": ".md", "md": ".md",
+    "bash": ".sh", "sh": ".sh", "shell": ".sh", "zsh": ".sh",
+    "powershell": ".ps1", "ps1": ".ps1", "bat": ".bat", "cmd": ".bat",
+    "sql": ".sql",
+    "java": ".java",
+    "kotlin": ".kt", "kt": ".kt",
+    "scala": ".scala",
+    "c": ".c", "h": ".h",
+    "cpp": ".cpp", "c++": ".cpp", "cxx": ".cpp", "cc": ".cpp", "hpp": ".hpp",
+    "csharp": ".cs", "c#": ".cs", "cs": ".cs",
+    "go": ".go", "golang": ".go",
+    "rust": ".rs", "rs": ".rs",
+    "ruby": ".rb", "rb": ".rb",
+    "php": ".php",
+    "perl": ".pl", "pl": ".pl",
+    "lua": ".lua",
+    "r": ".r",
+    "swift": ".swift",
+    "dart": ".dart",
+    "objective-c": ".m", "objc": ".m",
+    "haskell": ".hs", "hs": ".hs",
+    "elixir": ".ex", "ex": ".ex",
+    "erlang": ".erl",
+    "clojure": ".clj",
+    "lisp": ".lisp",
+    "vim": ".vim",
+    "dockerfile": ".dockerfile", "docker": ".dockerfile",
+    "makefile": ".mk", "make": ".mk",
+    "text": ".txt", "txt": ".txt", "plaintext": ".txt",
+}
+
+
+def ext_for_lang(lang: str) -> str:
+    """Vrátí vhodnou příponu souboru pro daný jazyk (nebo .txt)."""
+    key = (lang or "").strip().lower()
+    return LANG_EXT.get(key, ".txt")
+
+
+def extract_code_blocks(content: str) -> list[dict]:
+    """Vrátí seznam bloků kódu ve tvaru {'lang': ..., 'code': ...}."""
+    blocks: list[dict] = []
+    lines = content.split("\n")
+    i = 0
+    n = len(lines)
+    while i < n:
+        stripped = lines[i].lstrip()
+        if stripped.startswith("```"):
+            info = stripped[3:].strip()
+            lang = info.split()[0] if info else ""
+            code_lines: list[str] = []
+            i += 1
+            while i < n:
+                if lines[i].lstrip().startswith("```"):
+                    break
+                code_lines.append(lines[i])
+                i += 1
+            blocks.append({"lang": lang, "code": "\n".join(code_lines)})
+        i += 1
+    return blocks
+
+
+def unique_path(directory: str, base: str, ext: str) -> str:
+    """Vrátí cestu tak, aby nedocházelo k přepisu existujících souborů."""
+    candidate = os.path.join(directory, f"{base}{ext}")
+    if not os.path.exists(candidate):
+        return candidate
+    n = 2
+    while True:
+        candidate = os.path.join(directory, f"{base}_{n}{ext}")
+        if not os.path.exists(candidate):
+            return candidate
+        n += 1
+
 
 # ---------------------------------------------------------------------------
 # Statistika textu
@@ -161,22 +252,31 @@ class App:
         self.root = root
         self.history: list[dict] = []
         self.reply_buf: list[str] = []
+        self.last_reply_text: str = ""
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
         self.q: queue.Queue = queue.Queue()
         self.show_thinking = tk.BooleanVar(value=False)
+
+        # ukládání bloků kódu
+        self.auto_save_code = tk.BooleanVar(value=True)
+        self.save_dir_var = tk.StringVar(value=os.getcwd())
+        self.dir_label_var = tk.StringVar()
+        self.code_counter = 0
+
         # statistika
-        self.last_stats: dict = {}                # poslední odpověď serveru + doba
-        self.totals: dict = {                     # kumulativně za celý dialog
+        self.last_stats: dict = {}
+        self.totals: dict = {
             "replies": 0,
             "reply_chars": 0,
             "gen_s": 0.0,
             "eval": 0,
             "prompt_eval": 0,
         }
-        self._stats_fresh = False                 # přišla statistika pro tuto odpověď?
-        self._last_stats_update = 0.0             # throttle živého obnovování
+        self._stats_fresh = False
+        self._last_stats_update = 0.0
         self._build_ui()
+        self._update_dir_label()
         self.root.after(self.POLL_MS, self._poll)
 
     # -- UI -----------------------------------------------------------------
@@ -184,14 +284,14 @@ class App:
     def _build_ui(self):
         root = self.root
         root.title(f"Ollama kódový asistent – {DEFAULT_MODEL}")
-        root.geometry("1040x740")
+        root.geometry("1040x760")
         root.minsize(720, 480)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         mono = tkfont.nametofont("TkFixedFont").copy()
         mono.configure(size=11)
 
-        # ---- horní lišta -------------------------------------------------
+        # ---- horní lišta (1. řada: server, model) ------------------------
         bar = ttk.Frame(root, padding=(8, 6))
         bar.pack(side="top", fill="x")
 
@@ -217,6 +317,27 @@ class App:
         ttk.Button(bar, text="Nový dialog", command=self._new_dialog).pack(
             side="right", padx=3
         )
+
+        # ---- horní lišta (2. řada: ukládání bloků kódu) ------------------
+        bar2 = ttk.Frame(root, padding=(8, 0, 8, 6))
+        bar2.pack(side="top", fill="x")
+
+        ttk.Checkbutton(
+            bar2,
+            text="Automaticky ukládat bloky kódu z odpovědí",
+            variable=self.auto_save_code,
+        ).pack(side="left")
+
+        ttk.Button(
+            bar2, text="Složka…", command=self._choose_dir
+        ).pack(side="left", padx=(10, 4))
+        ttk.Button(
+            bar2, text="Uložit bloky kódu…", command=self._manual_save_blocks
+        ).pack(side="left", padx=3)
+
+        ttk.Label(
+            bar2, textvariable=self.dir_label_var, foreground="#606060"
+        ).pack(side="left", padx=(8, 0))
 
         # ---- dělicí okno: výstup nahoře, vstup dole ----------------------
         paned = ttk.Panedwindow(root, orient="vertical")
@@ -280,6 +401,9 @@ class App:
             label="Kopírovat celý výstup", command=self._copy_output
         )
         self.out_menu.add_command(label="Uložit výstup…", command=self._save_output)
+        self.out_menu.add_command(
+            label="Uložit bloky kódu…", command=self._manual_save_blocks
+        )
         self.out_menu.add_command(label="Statistika…", command=self._show_stats)
 
         self.in_menu = tk.Menu(root, tearoff=0)
@@ -413,7 +537,6 @@ class App:
                     self.reply_buf.append(payload)
                     self._append("bot", payload)
                     self.status_var.set("Generuji odpověď…")
-                    # živá statistika (max. 2× za sekundu, ať se text nečte pořád)
                     now = time.time()
                     if now - self._last_stats_update >= 0.5:
                         self._last_stats_update = now
@@ -441,6 +564,7 @@ class App:
                         self.history.append(
                             {"role": "assistant", "content": content}
                         )
+                        self.last_reply_text = content
                         if self._stats_fresh:
                             g = self.last_stats
                             self.totals["replies"] += 1
@@ -451,6 +575,11 @@ class App:
                                 g.get("prompt_eval_count") or 0
                             )
                         self._stats_fresh = False
+
+                        # automatické uložení bloků kódu
+                        if self.auto_save_code.get():
+                            self._save_blocks_from_text(content, auto=True)
+
                     self.reply_buf = []
                     self.send_btn.configure(state="normal")
                     self.stop_btn.configure(state="disabled")
@@ -501,13 +630,101 @@ class App:
 
     @staticmethod
     def _select_all(widget: tk.Text):
-        # nejdřív zrušit případný starý výběr, jinak by se rozsahy sčítaly
         widget.tag_remove("sel", "1.0", "end")
         widget.tag_add("sel", "1.0", "end-1c")
 
     @staticmethod
     def _paste_to(widget: tk.Text):
         widget.event_generate("<<Paste>>")
+
+    # -- ukládání bloků kódu ----------------------------------------------
+
+    def _update_dir_label(self):
+        path = self.save_dir_var.get() or os.getcwd()
+        shown = path if len(path) <= 60 else "…" + path[-57:]
+        self.dir_label_var.set(f"→ {shown}")
+
+    def _choose_dir(self):
+        chosen = filedialog.askdirectory(
+            parent=self.root,
+            title="Cílová složka pro bloky kódu",
+            initialdir=self.save_dir_var.get() or os.getcwd(),
+            mustexist=False,
+        )
+        if chosen:
+            self.save_dir_var.set(chosen)
+            self._update_dir_label()
+            self.status_var.set(f"Cílová složka: {chosen}")
+
+    def _manual_save_blocks(self):
+        if not self.last_reply_text:
+            messagebox.showinfo(
+                "Uložit bloky kódu",
+                "Zatím není uložená žádná odpověď, ze které by šly bloky vzít.",
+                parent=self.root,
+            )
+            return
+        saved = self._save_blocks_from_text(self.last_reply_text, auto=False)
+        if not saved:
+            messagebox.showinfo(
+                "Uložit bloky kódu",
+                "V poslední odpovědi nebyly nalezeny žádné bloky kódu (```…```).",
+                parent=self.root,
+            )
+
+    def _save_blocks_from_text(self, content: str, auto: bool = False) -> list[str]:
+        """Uloží všechny ```bloky``` z textu jako samostatné soubory.
+
+        Vrací seznam cest k uloženým souborům.
+        """
+        blocks = extract_code_blocks(content)
+        if not blocks:
+            if not auto:
+                self.status_var.set("V odpovědi nejsou žádné bloky kódu.")
+            return []
+
+        directory = self.save_dir_var.get().strip() or os.getcwd()
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror(
+                "Chyba ukládání",
+                f"Není možné vytvořit složku:\n{directory}\n\n{e}",
+                parent=self.root,
+            )
+            return []
+
+        saved: list[str] = []
+        for block in blocks:
+            ext = ext_for_lang(block["lang"])
+            self.code_counter += 1
+            base = f"blok_{self.code_counter}"
+            path = unique_path(directory, base, ext)
+            code = block["code"]
+            if not code.endswith("\n"):
+                code += "\n"
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(code)
+                saved.append(path)
+            except OSError as e:
+                self._append(
+                    "err",
+                    f"\nNelze uložit blok kódu do {path}: {e}\n",
+                )
+                self.status_var.set("Chyba při ukládání bloku kódu.")
+
+        if saved:
+            names = ", ".join(os.path.basename(p) for p in saved)
+            prefix = "Automaticky uloženo" if auto else "Uloženo"
+            self.status_var.set(f"{prefix} {len(saved)} blok(ů) kódu: {names}")
+            if not auto:
+                messagebox.showinfo(
+                    "Bloky kódu uloženy",
+                    "Uložené soubory:\n" + "\n".join(saved),
+                    parent=self.root,
+                )
+        return saved
 
     # -- statistika --------------------------------------------------------
 
@@ -595,6 +812,12 @@ class App:
                 f"{t['eval'] / t['replies']:.0f} tokenů"
             )
 
+        lines += ["", "— Ukládání kódu —",
+                  f"Cílová složka:  {self.save_dir_var.get() or os.getcwd()}",
+                  f"Automatické ukládání:  "
+                  f"{'zapnuto' if self.auto_save_code.get() else 'vypnuto'}",
+                  f"Uložených souborů v této relaci:  {self.code_counter}"]
+
         messagebox.showinfo(
             "Statistika výstupu", "\n".join(lines), parent=self.root
         )
@@ -608,6 +831,7 @@ class App:
         self.out_text.delete("1.0", "end")
         self.history.clear()
         self.reply_buf.clear()
+        self.last_reply_text = ""
         self.last_stats = {}
         self.totals = {"replies": 0, "reply_chars": 0, "gen_s": 0.0,
                        "eval": 0, "prompt_eval": 0}
