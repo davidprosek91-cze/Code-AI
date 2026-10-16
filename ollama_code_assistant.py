@@ -1,34 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ollama kódový asistent
-======================
+Ollama kódový asistent – optimalizovaná verze
+==============================================
 GUI aplikace (tkinter) pro psaní dlouhého kódu s lokálním modelem Ollama.
 
   Výchozí server: http://localhost:11434
   Výchozí model:  qwen3.5:0.8b   (obě hodnoty lze změnit v liště nahoře)
 
-Spuštění:
-  python3 ollama_code_assistant.py
+Optimalizace oproti původní verzi:
+  - inkrementální StatTracker místo O(n) skenu celého výstupu při každém refreshi
+  - batchované vkládání chunků do widgetu (1 insert + 1 yview na poll cyklus)
+  - queue.SimpleQueue (nižší režie)
+  - time.monotonic() / perf_counter() (monotónní, přesnější)
+  - word count přes str.split() bez regexu
+  - throttlovaný refresh statistik (0.5 s při streamu, okamžitý po dokončení)
 
 Ovládání:
   Ctrl+Enter   odešle požadavek (z pole Vstup)
   Ctrl+C       zkopíruje označený text (funguje ve výstupu i ve vstupu)
-  Pravé tlačítko myši  kontextové menu (kopírovat označené, označit vše, vložit)
+  Pravé tlačítko myši  kontextové menu
   Tlačítko     Zastavit přeruší běžící generování
-
-Statistika:
-  řádek pod výstupem    znaky / slova / řádky / bloky kódu + rychlost generování
-  tlačítko Statistika…  detailní přehled: tokeny a doby z Ollamy, jazyky kódu,
-                        kumulativní součty celého dialogu
-
-Bloky kódu:
-  Bloky ```…``` z odpovědí modelu se ukládají jako samostatné soubory
-  do zvolené složky (výchozí = aktuální pracovní složka).
-  Automatické ukládání lze vypnout zaškrtávátkem v liště.
-
-Vyžaduje běžící `ollama serve` a stažený model:
-  ollama pull qwen3.5:0.8b
 """
 
 from __future__ import annotations
@@ -36,7 +28,6 @@ from __future__ import annotations
 import json
 import os
 import queue
-import re
 import threading
 import time
 import urllib.error
@@ -101,26 +92,22 @@ LANG_EXT = {
 
 def ext_for_lang(lang: str) -> str:
     """Vrátí vhodnou příponu souboru pro daný jazyk (nebo .txt)."""
-    key = (lang or "").strip().lower()
-    return LANG_EXT.get(key, ".txt")
+    return LANG_EXT.get((lang or "").strip().lower(), ".txt")
 
 
 def extract_code_blocks(content: str) -> list[dict]:
     """Vrátí seznam bloků kódu ve tvaru {'lang': ..., 'code': ...}."""
     blocks: list[dict] = []
     lines = content.split("\n")
-    i = 0
     n = len(lines)
+    i = 0
     while i < n:
-        stripped = lines[i].lstrip()
-        if stripped.startswith("```"):
-            info = stripped[3:].strip()
+        if lines[i].lstrip().startswith("```"):
+            info = lines[i].lstrip()[3:].strip()
             lang = info.split()[0] if info else ""
             code_lines: list[str] = []
             i += 1
-            while i < n:
-                if lines[i].lstrip().startswith("```"):
-                    break
+            while i < n and not lines[i].lstrip().startswith("```"):
                 code_lines.append(lines[i])
                 i += 1
             blocks.append({"lang": lang, "code": "\n".join(code_lines)})
@@ -142,7 +129,7 @@ def unique_path(directory: str, base: str, ext: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Statistika textu
+# Statistika textu – jednorázová (používá se jen v modálním dialogu)
 # ---------------------------------------------------------------------------
 
 def analyze_text(content: str) -> dict:
@@ -172,6 +159,76 @@ def analyze_text(content: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Inkrementální tracker statistik – O(chunk) místo O(celý výstup)
+# ---------------------------------------------------------------------------
+
+class StatTracker:
+    """Sleduje znaky/slova/řádky/bloky přírůstkově, jak přicházejí chunky.
+
+    Umožňuje zobrazovat živou statistiku bez opakovaného skenování celého
+    textu widgetu (což je u dlouhých výstupů výrazně dražší).
+    """
+
+    __slots__ = (
+        "chars", "words", "newlines", "blocks", "langs",
+        "_last_was_space", "_in_block", "_partial",
+    )
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.chars = 0
+        self.words = 0
+        self.newlines = 0
+        self.blocks = 0
+        self.langs: dict[str, int] = {}
+        self._last_was_space = True   # byl poslední znak bílé místo?
+        self._in_block = False        # jsme uvnitř ``` bloku?
+        self._partial = ""            # nedokončený řádek (bez \n na konci)
+
+    def feed(self, text: str) -> None:
+        if not text:
+            return
+
+        self.chars += len(text)
+
+        # --- slova (přes C-optimized str.split) ---
+        wc = len(text.split())
+        if wc and not self._last_was_space and not text[0].isspace():
+            wc -= 1  # první „slovo" navazuje na předchozí chunk
+        self.words += wc
+        self._last_was_space = text[-1].isspace()
+
+        # --- řádky + fence ``` ---
+        if "\n" in text:
+            combined = self._partial + text
+            parts = combined.split("\n")
+            self._partial = parts[-1]
+            for line in parts[:-1]:
+                self.newlines += 1
+                self._check_line(line)
+        else:
+            self._partial += text
+
+    def _check_line(self, line: str) -> None:
+        s = line.lstrip()
+        if s.startswith("```"):
+            if self._in_block:
+                self._in_block = False
+            else:
+                self._in_block = True
+                self.blocks += 1
+                lang = s[3:].strip() or "(bez jazyka)"
+                self.langs[lang] = self.langs.get(lang, 0) + 1
+
+    def snapshot(self) -> tuple[int, int, int, int, dict[str, int]]:
+        """Vrátí (chars, words, lines, blocks, langs) jako jednorázový snapshot."""
+        lines = self.newlines + (1 if self.chars else 0)
+        return self.chars, self.words, lines, self.blocks, self.langs
+
+
+# ---------------------------------------------------------------------------
 # Klient Ollama
 # ---------------------------------------------------------------------------
 
@@ -185,9 +242,7 @@ class OllamaClient:
     def stream(self, messages, stop_event, on_thinking, on_chunk) -> dict:
         """Postupně volá on_thinking/on_chunk.
 
-        Vrací slovník se statistikami z poslední (hotové) zprávy serveru
-        (eval_count, eval_duration, prompt_eval_count, …), případně prázdný
-        slovník, pokud bylo generování přerušeno stop_event.
+        Vrací slovník se statistikami z poslední (hotové) zprávy serveru.
         """
         payload = json.dumps(
             {
@@ -225,7 +280,6 @@ class OllamaClient:
                 if content:
                     on_chunk(content)
                 if obj.get("done"):
-                    # poslední zpráva streamu obsahuje statistiky běhu
                     for key in (
                         "eval_count",
                         "eval_duration",
@@ -247,6 +301,7 @@ class OllamaClient:
 
 class App:
     POLL_MS = 60
+    STATS_THROTTLE = 0.5   # s – jak často obnovovat řádek statistik při streamu
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -255,7 +310,7 @@ class App:
         self.last_reply_text: str = ""
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
-        self.q: queue.Queue = queue.Queue()
+        self.q: queue.SimpleQueue = queue.SimpleQueue()
         self.show_thinking = tk.BooleanVar(value=False)
 
         # ukládání bloků kódu
@@ -274,7 +329,10 @@ class App:
             "prompt_eval": 0,
         }
         self._stats_fresh = False
+        self._tracker = StatTracker()
         self._last_stats_update = 0.0
+        self._last_perf = 0.0
+
         self._build_ui()
         self._update_dir_label()
         self.root.after(self.POLL_MS, self._poll)
@@ -328,9 +386,9 @@ class App:
             variable=self.auto_save_code,
         ).pack(side="left")
 
-        ttk.Button(
-            bar2, text="Složka…", command=self._choose_dir
-        ).pack(side="left", padx=(10, 4))
+        ttk.Button(bar2, text="Složka…", command=self._choose_dir).pack(
+            side="left", padx=(10, 4)
+        )
         ttk.Button(
             bar2, text="Uložit bloky kódu…", command=self._manual_save_blocks
         ).pack(side="left", padx=3)
@@ -353,20 +411,27 @@ class App:
             top, wrap="none", font=mono, undo=False, state="normal"
         )
         self.out_text.pack(fill="both", expand=True)
-        self.out_text.tag_configure("user", font=(mono.actual("family"), 11, "bold"),
-                                    foreground="#0b3d91", spacing3=4)
+        self.out_text.tag_configure(
+            "user", font=(mono.actual("family"), 11, "bold"),
+            foreground="#0b3d91", spacing3=4
+        )
         self.out_text.tag_configure("bot", spacing1=1)
-        self.out_text.tag_configure("think", foreground="#8a8a8a", font=("TkFixedFont", 10, "italic"))
+        self.out_text.tag_configure(
+            "think", foreground="#8a8a8a",
+            font=("TkFixedFont", 10, "italic")
+        )
         self.out_text.tag_configure("err", foreground="#b00000")
-        self.out_text.tag_configure("sys", foreground="#606060", font=("TkFixedFont", 10, "italic"))
+        self.out_text.tag_configure(
+            "sys", foreground="#606060", font=("TkFixedFont", 10, "italic")
+        )
 
-        # ---- statistika + kopírování (řádek pod textem) --------------------
+        # ---- statistika + kopírování (řádek pod textem) ------------------
         srow = ttk.Frame(top)
         srow.pack(side="bottom", fill="x", pady=(3, 0))
         self.stats_var = tk.StringVar(value="Statistika se zobrazí po první odpovědi.")
-        ttk.Button(srow, text="Kopírovat označené", command=self._copy_selection).pack(
-            side="right", padx=(6, 0)
-        )
+        ttk.Button(
+            srow, text="Kopírovat označené", command=self._copy_selection
+        ).pack(side="right", padx=(6, 0))
         ttk.Button(srow, text="Kopírovat výstup", command=self._copy_output).pack(
             side="right", padx=(6, 0)
         )
@@ -377,9 +442,9 @@ class App:
             side="left", fill="x", expand=True
         )
 
-        ttk.Label(bottom, text="Vstup (Ctrl+Enter odešle, Enter nový řádek)").pack(
-            anchor="w", padx=2, pady=(4, 2)
-        )
+        ttk.Label(
+            bottom, text="Vstup (Ctrl+Enter odešle, Enter nový řádek)"
+        ).pack(anchor="w", padx=2, pady=(4, 2))
         self.in_text = scrolledtext.ScrolledText(
             bottom, wrap="word", font=mono, height=7, undo=True
         )
@@ -434,11 +499,14 @@ class App:
 
         self.send_btn = ttk.Button(foot, text="Odeslat", command=self._send)
         self.send_btn.pack(side="left")
-        self.stop_btn = ttk.Button(foot, text="Zastavit", command=self._stop,
-                                   state="disabled")
+        self.stop_btn = ttk.Button(
+            foot, text="Zastavit", command=self._stop, state="disabled"
+        )
         self.stop_btn.pack(side="left", padx=(6, 0))
 
-        self.status_var = tk.StringVar(value="Připraveno – napište požadavek do vstupu.")
+        self.status_var = tk.StringVar(
+            value="Připraveno – napište požadavek do vstupu."
+        )
         ttk.Label(foot, textvariable=self.status_var, anchor="w").pack(
             side="left", padx=14
         )
@@ -473,27 +541,27 @@ class App:
         self.stop_btn.configure(state="normal")
         self.status_var.set(f"Odesláno modelu {model}…")
 
+        self._last_perf = time.perf_counter()
         self.worker = threading.Thread(
             target=self._run, args=(host, model, messages), daemon=True
         )
         self.worker.start()
 
     def _run(self, host: str, model: str, messages):
-        t0 = time.time()
+        t0 = time.perf_counter()
+        put = self.q.put  # lokální reference (mikro-optimalizace)
         try:
             client = OllamaClient(host, model)
             raw_stats = client.stream(
                 messages,
                 self.stop_event,
-                lambda t: self.q.put(("thinking", t)),
-                lambda c: self.q.put(("chunk", c)),
+                lambda t: put(("thinking", t)),
+                lambda c: put(("chunk", c)),
             )
             stats = dict(raw_stats or {})
-            stats["gen_s"] = time.time() - t0
+            stats["gen_s"] = time.perf_counter() - t0
             if self.stop_event.is_set():
-                self.q.put(
-                    ("status", f"Generování zastaveno po {stats['gen_s']:.1f} s.")
-                )
+                put(("status", f"Generování zastaveno po {stats['gen_s']:.1f} s."))
             else:
                 msg = f"Hotovo · {stats['gen_s']:.1f} s"
                 tps = self._toks_per_s(stats)
@@ -501,15 +569,15 @@ class App:
                     msg += f" · {stats['eval_count']} tokenů"
                     if tps:
                         msg += f" ({tps:.1f} tok/s)"
-                self.q.put(("status", msg))
-            self.q.put(("stats", stats))
+                put(("status", msg))
+            put(("stats", stats))
         except urllib.error.URLError as e:
-            self.q.put(("error", f"Chyba spojení se serverem {host}: {e.reason}\n"
-                                 "Zkontrolujte, zda běží `ollama serve`."))
-        except Exception as e:  # noqa: BLE001 – chceme ukázat jakoukoli chybu
-            self.q.put(("error", f"Chyba: {e}"))
+            put(("error", f"Chyba spojení se serverem {host}: {e.reason}\n"
+                          "Zkontrolujte, zda běží `ollama serve`."))
+        except Exception as e:  # noqa: BLE001
+            put(("error", f"Chyba: {e}"))
         finally:
-            self.q.put(("finished", None))
+            put(("finished", None))
 
     @staticmethod
     def _toks_per_s(stats: dict) -> float:
@@ -528,20 +596,24 @@ class App:
     # -- příjem streamu ----------------------------------------------------
 
     def _poll(self):
+        q_get = self.q.get_nowait
+        chunk_buf: list[str] = []
+        forced_stats = False
+
         try:
             while True:
-                kind, payload = self.q.get_nowait()
+                kind, payload = q_get()
+
                 if kind == "chunk":
-                    if not self.reply_buf:
-                        self._append("bot", "")  # udrží pořadí, nic nezobrazí
-                    self.reply_buf.append(payload)
-                    self._append("bot", payload)
-                    self.status_var.set("Generuji odpověď…")
-                    now = time.time()
-                    if now - self._last_stats_update >= 0.5:
-                        self._last_stats_update = now
-                        self._refresh_stats()
-                elif kind == "thinking":
+                    chunk_buf.append(payload)
+                    continue
+
+                # vyprázdnit nasbírané chunky před zpracováním jiné zprávy
+                if chunk_buf:
+                    self._flush_chunks(chunk_buf)
+                    chunk_buf = []
+
+                if kind == "thinking":
                     if self.show_thinking.get():
                         if not self.thinking_seen:
                             self._append("think", "\n— úvahy modelu —\n")
@@ -549,15 +621,20 @@ class App:
                     elif not self.thinking_seen:
                         self.status_var.set("Model přemýšlí…")
                     self.thinking_seen = True
+
                 elif kind == "status":
                     self.status_var.set(payload)
+
                 elif kind == "stats":
                     self.last_stats = payload
                     self._stats_fresh = True
-                    self._refresh_stats()
+                    forced_stats = True
+
                 elif kind == "error":
                     self._append("err", f"\n{payload}\n")
                     self.status_var.set("Chyba – viz výstup.")
+                    forced_stats = True
+
                 elif kind == "finished":
                     if self.reply_buf:
                         content = "".join(self.reply_buf)
@@ -576,26 +653,53 @@ class App:
                             )
                         self._stats_fresh = False
 
-                        # automatické uložení bloků kódu
                         if self.auto_save_code.get():
                             self._save_blocks_from_text(content, auto=True)
 
                     self.reply_buf = []
                     self.send_btn.configure(state="normal")
                     self.stop_btn.configure(state="disabled")
-                    self._refresh_stats()
+                    forced_stats = True
+
         except queue.Empty:
             pass
+
+        if chunk_buf:
+            self._flush_chunks(chunk_buf)
+
+        # --- throttlovaný refresh statistik ---
+        now = time.monotonic()
+        if forced_stats or (
+            chunk_buf and now - self._last_stats_update >= self.STATS_THROTTLE
+        ):
+            self._refresh_stats()
+            self._last_stats_update = now
+
         self.root.after(self.POLL_MS, self._poll)
+
+    def _flush_chunks(self, chunks: list[str]):
+        """Vloží nasbírané chunky jedním insertem + jedním yview checkem."""
+        text = "".join(chunks)
+        self.reply_buf.append(text)
+
+        # detekce, zda uživatel je na konci (1 yview call místo N)
+        at_bottom = self.out_text.yview()[1] >= 0.999
+        self.out_text.insert("end", text, "bot")
+        if at_bottom:
+            self.out_text.see("end")
+
+        # inkrementální tracker (žádný full-scan)
+        self._tracker.feed(text)
+        self.status_var.set("Generuji odpověď…")
 
     # -- pomocné akce ------------------------------------------------------
 
     def _append(self, tag: str, text: str):
-        bar = self.out_text.yview()
-        at_bottom = bar[1] >= 0.999
+        at_bottom = self.out_text.yview()[1] >= 0.999
         self.out_text.insert("end", text, tag)
         if at_bottom:
             self.out_text.see("end")
+        self._tracker.feed(text)
 
     # -- kopírování označeného textu --------------------------------------
 
@@ -606,7 +710,6 @@ class App:
             menu.grab_release()
 
     def _on_copy_key(self, event: tk.Event):
-        """Ctrl+C – kopíruje označený text z widgetu, do kterého míří."""
         self._copy_selection(event.widget)
         return "break"
 
@@ -673,10 +776,7 @@ class App:
             )
 
     def _save_blocks_from_text(self, content: str, auto: bool = False) -> list[str]:
-        """Uloží všechny ```bloky``` z textu jako samostatné soubory.
-
-        Vrací seznam cest k uloženým souborům.
-        """
+        """Uloží všechny ```bloky``` z textu jako samostatné soubory."""
         blocks = extract_code_blocks(content)
         if not blocks:
             if not auto:
@@ -709,8 +809,7 @@ class App:
                 saved.append(path)
             except OSError as e:
                 self._append(
-                    "err",
-                    f"\nNelze uložit blok kódu do {path}: {e}\n",
+                    "err", f"\nNelze uložit blok kódu do {path}: {e}\n"
                 )
                 self.status_var.set("Chyba při ukládání bloku kódu.")
 
@@ -729,14 +828,13 @@ class App:
     # -- statistika --------------------------------------------------------
 
     def _refresh_stats(self):
-        """Obnoví kompaktní řádek statistiky pod výstupním textem."""
-        content = self.out_text.get("1.0", "end-1c")
-        st = analyze_text(content)
+        """Obnoví kompaktní řádek statistik z inkrementálního trackeru."""
+        chars, words, lines, blocks, _langs = self._tracker.snapshot()
         parts = [
-            f"Znaky {st['chars']}",
-            f"Slova {st['words']}",
-            f"Řádky {st['lines']}",
-            f"Bloků kódu {st['blocks']}",
+            f"Znaky {chars}",
+            f"Slova {words}",
+            f"Řádky {lines}",
+            f"Bloků kódu {blocks}",
         ]
         g = self.last_stats
         if g.get("eval_count") or g.get("gen_s"):
@@ -748,11 +846,11 @@ class App:
                     seg += f" · {tps:.1f} tok/s"
             parts.append(seg)
         elif self.worker and self.worker.is_alive():
-            parts.append(f"Generuji… {st['chars']} znaků")
+            parts.append(f"Generuji… {chars} znaků")
         self.stats_var.set("  ·  ".join(parts))
 
     def _show_stats(self):
-        """Detailní statistika: poslední odpověď Ollamy, text i celý dialog."""
+        """Detailní statistika – používá jeden full-scan (volané zřídka)."""
         g = self.last_stats
         t = self.totals
         st = analyze_text(self.out_text.get("1.0", "end-1c"))
@@ -790,33 +888,39 @@ class App:
         else:
             lines.append("Zatím žádná odpověď.")
 
-        lines += ["", "— Text ve výstupu —",
-                  f"Znaky:  {st['chars']}   Slova:  {st['words']}   "
-                  f"Řádky:  {st['lines']}",
-                  f"Bloky kódu:  {st['blocks']}"]
+        lines += [
+            "", "— Text ve výstupu —",
+            f"Znaky:  {st['chars']}   Slova:  {st['words']}   "
+            f"Řádky:  {st['lines']}",
+            f"Bloky kódu:  {st['blocks']}",
+        ]
         if st["langs"]:
             lines.append(
                 "Jazyky:  "
                 + ", ".join(f"{k}: {v}" for k, v in sorted(st["langs"].items()))
             )
 
-        lines += ["", "— Celý dialog —",
-                  f"Odpovědí:  {t['replies']}   "
-                  f"Znaků odpovědí:  {t['reply_chars']}",
-                  f"Celkový čas generování:  {t['gen_s']:.1f} s",
-                  f"Tokeny odpovědí celkem:  {t['eval']}   "
-                  f"Vstupní tokeny celkem:  {t['prompt_eval']}"]
+        lines += [
+            "", "— Celý dialog —",
+            f"Odpovědí:  {t['replies']}   "
+            f"Znaků odpovědí:  {t['reply_chars']}",
+            f"Celkový čas generování:  {t['gen_s']:.1f} s",
+            f"Tokeny odpovědí celkem:  {t['eval']}   "
+            f"Vstupní tokeny celkem:  {t['prompt_eval']}",
+        ]
         if t["replies"] and t["gen_s"]:
             lines.append(
                 f"Průměr na odpověď:  {t['gen_s'] / t['replies']:.1f} s, "
                 f"{t['eval'] / t['replies']:.0f} tokenů"
             )
 
-        lines += ["", "— Ukládání kódu —",
-                  f"Cílová složka:  {self.save_dir_var.get() or os.getcwd()}",
-                  f"Automatické ukládání:  "
-                  f"{'zapnuto' if self.auto_save_code.get() else 'vypnuto'}",
-                  f"Uložených souborů v této relaci:  {self.code_counter}"]
+        lines += [
+            "", "— Ukládání kódu —",
+            f"Cílová složka:  {self.save_dir_var.get() or os.getcwd()}",
+            f"Automatické ukládání:  "
+            f"{'zapnuto' if self.auto_save_code.get() else 'vypnuto'}",
+            f"Uložených souborů v této relaci:  {self.code_counter}",
+        ]
 
         messagebox.showinfo(
             "Statistika výstupu", "\n".join(lines), parent=self.root
@@ -825,7 +929,8 @@ class App:
     def _new_dialog(self):
         content = self.out_text.get("1.0", "end").strip()
         if content and not messagebox.askyesno(
-            "Nový dialog", "Smazat celý výstup a začít nový dialog?", parent=self.root
+            "Nový dialog", "Smazat celý výstup a začít nový dialog?",
+            parent=self.root,
         ):
             return
         self.out_text.delete("1.0", "end")
@@ -836,13 +941,13 @@ class App:
         self.totals = {"replies": 0, "reply_chars": 0, "gen_s": 0.0,
                        "eval": 0, "prompt_eval": 0}
         self._stats_fresh = False
+        self._tracker.reset()          # <-- reset inkrementálního trackeru
         self._refresh_stats()
         self.status_var.set("Nový dialog – historie byla smazána.")
 
     def _copy_output(self):
-        content = self.out_text.get("1.0", "end-1c")
         self.root.clipboard_clear()
-        self.root.clipboard_append(content)
+        self.root.clipboard_append(self.out_text.get("1.0", "end-1c"))
         self.status_var.set("Výstup zkopírován do schránky.")
 
     def _save_output(self):
