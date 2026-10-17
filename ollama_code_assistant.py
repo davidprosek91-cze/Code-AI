@@ -28,12 +28,15 @@ Reflexe kódu:
     modelu krátkou výzvu, aby se zamyslel nad možnými problémy v právě
     napsaném kódu (chyby, edge-cases, vylepšení), a pak automaticky
     pokračuje v generování se zohledněním této reflexe.
-  - Text reflexe se zobrazuje v PRAVÉM panelu (spolu s běžnými úvahami
-    modelu). Levý panel (výstup) zůstává čistý a obsahuje pouze kód.
+  - Text reflexe se zobrazuje v PRAVÉM HORNÍM panelu (spolu s běžnými
+    úvahami modelu). Levý panel (výstup) zůstává čistý a obsahuje pouze kód.
+  - Text reflexe se zobrazuje CELÝ (žádné zkracování).
 
-Dva panely:
+Panely:
   - LEVÝ panel  = čistý výstup asistenta (kód, značky VSTUP/POKRAČOVÁNÍ, chyby)
-  - PRAVÝ panel = veškeré „thinking“ modelu a automatické reflexe kódu
+  - PRAVÝ panel = rozdělen horizontálně na 2 části:
+        HORNÍ = veškeré „thinking“ modelu a automatické reflexe kódu
+        DOLNÍ = statistiky výstupu Ollamy (eval_count, tok/s, doby, done_reason…)
 
 Ovládání:
   Ctrl+Enter   odešle požadavek (z pole Vstup)
@@ -404,9 +407,12 @@ class App:
 
         # příznak prvního „thinking“ v rámci jednoho běhu
         self.thinking_seen = False
+        # příznak prvního reflection chunku v rámci jednoho běhu (kvůli hlavičce)
+        self._reflection_hdr_seen = False
 
         self._build_ui()
         self._update_dir_label()
+        self._update_ollama_stats({})  # inicializace prázdného panelu
         self.root.after(self.POLL_MS, self._poll)
 
     # -- UI -----------------------------------------------------------------
@@ -490,7 +496,7 @@ class App:
 
         ttk.Label(
             bar3,
-            text="řádků (reflexe se zobrazí v pravém panelu; levý výstup zůstává čistý)",
+            text="řádků (reflexe se zobrazí v pravém horním panelu; levý výstup zůstává čistý)",
             foreground="#505050",
         ).pack(side="left")
 
@@ -503,7 +509,7 @@ class App:
         paned.add(top, weight=3)
         paned.add(bottom, weight=1)
 
-        # --- horizontální rozdělení: vlevo výstup, vpravo thinking/reflexe ---
+        # --- horizontální rozdělení: vlevo výstup, vpravo thinking+stats ---
         h_paned = ttk.Panedwindow(top, orient="horizontal")
         h_paned.pack(fill="both", expand=True)
 
@@ -536,15 +542,25 @@ class App:
         self.out_text.mark_set("end_mark", "end-1c")
         self.out_text.mark_gravity("end_mark", "right")
 
-        # ---- PRAVÝ PANEL: úvahy modelu + reflexe ------------------------
+        # ---- PRAVÝ PANEL: horní = thinking/reflexe, dolní = statistiky ---
+        # Vertikální dělení pravého panelu na 2 okna
+        v_paned = ttk.Panedwindow(right_frame, orient="vertical")
+        v_paned.pack(fill="both", expand=True)
+
+        think_frame = ttk.Frame(v_paned)
+        stats_frame = ttk.Frame(v_paned)
+        v_paned.add(think_frame, weight=3)
+        v_paned.add(stats_frame, weight=2)
+
+        # -- HORNÍ PRAVÉ OKNO: úvahy modelu + reflexe ----------------------
         ttk.Label(
-            right_frame,
+            think_frame,
             text="Úvahy modelu (thinking) a reflexe kódu",
             foreground="#505050",
         ).pack(anchor="w", padx=2, pady=(0, 2))
 
         self.think_text = scrolledtext.ScrolledText(
-            right_frame, wrap="word", font=mono, undo=False, state="normal"
+            think_frame, wrap="word", font=mono, undo=False, state="normal"
         )
         self.think_text.pack(fill="both", expand=True)
         self.think_text.tag_configure(
@@ -552,12 +568,71 @@ class App:
             font=("TkFixedFont", 10, "italic")
         )
         self.think_text.tag_configure(
-            "refl", foreground="#306030",
+            "refl", foreground="#1f6f1f",
             font=("TkFixedFont", 10, "italic"), spacing1=2, spacing3=2
         )
         self.think_text.tag_configure(
             "hdr", foreground="#404040",
             font=("TkFixedFont", 10, "bold"), spacing1=6, spacing3=2
+        )
+        self.think_text.tag_configure(
+            "refl_hdr", foreground="#306030",
+            font=("TkFixedFont", 10, "bold"), spacing1=6, spacing3=2
+        )
+
+        # -- DOLNÍ PRAVÉ OKNO: statistiky výstupu Ollamy -------------------
+        stats_hdr = ttk.Frame(stats_frame)
+        stats_hdr.pack(fill="x", padx=2, pady=(0, 2))
+        ttk.Label(
+            stats_hdr,
+            text="Statistiky výstupu Ollamy",
+            foreground="#505050",
+        ).pack(side="left")
+        ttk.Button(
+            stats_hdr,
+            text="Kopírovat",
+            width=10,
+            command=self._copy_ollama_stats,
+        ).pack(side="right")
+        ttk.Button(
+            stats_hdr,
+            text="Smazat",
+            width=8,
+            command=self._clear_ollama_stats,
+        ).pack(side="right", padx=(0, 4))
+
+        self.ollama_stats_text = scrolledtext.ScrolledText(
+            stats_frame, wrap="word", font=mono, undo=False, state="normal",
+            height=8,
+        )
+        self.ollama_stats_text.pack(fill="both", expand=True)
+        self.ollama_stats_text.tag_configure(
+            "hdr", foreground="#0b3d91",
+            font=("TkFixedFont", 10, "bold"), spacing1=4, spacing3=2
+        )
+        self.ollama_stats_text.tag_configure(
+            "kv_key", foreground="#404040",
+            font=("TkFixedFont", 10, "bold")
+        )
+        self.ollama_stats_text.tag_configure(
+            "kv_val", foreground="#000000",
+            font=("TkFixedFont", 10)
+        )
+        self.ollama_stats_text.tag_configure(
+            "good", foreground="#006600",
+            font=("TkFixedFont", 10, "bold")
+        )
+        self.ollama_stats_text.tag_configure(
+            "warn", foreground="#b06000",
+            font=("TkFixedFont", 10, "bold")
+        )
+        self.ollama_stats_text.tag_configure(
+            "err", foreground="#b00000",
+            font=("TkFixedFont", 10, "bold")
+        )
+        self.ollama_stats_text.tag_configure(
+            "sep", foreground="#a0a0a0",
+            font=("TkFixedFont", 10)
         )
 
         # ---- statistika + kopírování (řádek pod textem) ------------------
@@ -631,7 +706,7 @@ class App:
         )
         self.in_menu.add_command(label="Odeslat    Ctrl+Enter", command=self._send)
 
-        # menu pro pravý panel (úvahy)
+        # menu pro pravý horní panel (úvahy + reflexe)
         self.think_menu = tk.Menu(root, tearoff=0)
         self.think_menu.add_command(
             label="Kopírovat označené    Ctrl+C",
@@ -651,13 +726,36 @@ class App:
             command=self._clear_thinking,
         )
 
-        for w in (self.out_text, self.in_text, self.think_text):
+        # menu pro pravý dolní panel (statistiky Ollamy)
+        self.ollama_stats_menu = tk.Menu(root, tearoff=0)
+        self.ollama_stats_menu.add_command(
+            label="Kopírovat označené    Ctrl+C",
+            command=lambda: self._copy_selection(self.ollama_stats_text),
+        )
+        self.ollama_stats_menu.add_command(
+            label="Označit vše",
+            command=lambda: self._select_all(self.ollama_stats_text),
+        )
+        self.ollama_stats_menu.add_separator()
+        self.ollama_stats_menu.add_command(
+            label="Kopírovat celé statistiky",
+            command=self._copy_ollama_stats,
+        )
+        self.ollama_stats_menu.add_command(
+            label="Smazat panel statistik",
+            command=self._clear_ollama_stats,
+        )
+
+        for w in (self.out_text, self.in_text, self.think_text, self.ollama_stats_text):
             w.bind("<Control-c>", self._on_copy_key)
             w.bind("<Control-C>", self._on_copy_key)
         self.out_text.bind("<Button-3>", lambda e: self._popup(self.out_menu, e))
         self.in_text.bind("<Button-3>", lambda e: self._popup(self.in_menu, e))
         self.think_text.bind(
             "<Button-3>", lambda e: self._popup(self.think_menu, e)
+        )
+        self.ollama_stats_text.bind(
+            "<Button-3>", lambda e: self._popup(self.ollama_stats_menu, e)
         )
 
         # ---- spodní lišta ------------------------------------------------
@@ -729,6 +827,7 @@ class App:
         self.stop_event.clear()
         self.user_stop.clear()
         self.thinking_seen = False
+        self._reflection_hdr_seen = False
         self._stats_fresh = False
         self._last_done_reason = ""
         self._reflective_active = self.reflect_enabled.get()
@@ -813,8 +912,8 @@ class App:
           1. Streamuj obsah, dokud neuplyne ~N řádků (počítáno podle \\n).
           2. Zastav stream, přidej vygenerovaný text jako assistant zprávu.
           3. Pošli modelu výzvu k reflexi (chyby, edge-cases, vylepšení).
-          4. Streamuj krátkou reflexi – ta jde do PRAVÉHO panelu (thinking),
-             levý výstup zůstává čistý.
+          4. Streamuj CELOU reflexi – ta jde do PRAVÉHO HORNÍHO panelu
+             (thinking), levý výstup zůstává čistý.
           5. Přidej reflexi do historie a pošli pokyn k pokračování.
           6. Opakuj, dokud model sám neskončí nebo uživatel nezastaví.
         """
@@ -882,9 +981,9 @@ class App:
                     # Přirozený konec – model sám dokončil
                     break
 
-                # ---------- REFLEXNÍ FÁZE (skrytá – jen do pravého panelu) ----------
+                # ---------- REFLEXNÍ FÁZE (skrytá – jen do pravého horního panelu) ----------
                 self._reflection_count += 1
-                put(("thinking",
+                put(("reflection_hdr",
                      f"\n── Reflexe č. {self._reflection_count} "
                      f"(po {line_limit} řádcích) ──\n"))
                 put(("status", f"Reflexe kódu č. {self._reflection_count}…"))
@@ -897,8 +996,9 @@ class App:
 
                 def on_refl(c):
                     refl_chars.append(c)
-                    # Reflexe jde jako "thinking" – zobrazí se v pravém panelu.
-                    put(("thinking", c))
+                    # CELÁ reflexe jde jako "reflection" – zobrazí se v pravém
+                    # horním panelu (thinking) se zeleným tagem, nic se nezkracuje.
+                    put(("reflection", c))
 
                 try:
                     client.stream(
@@ -989,7 +1089,7 @@ class App:
                     chunk_buf = []
 
                 if kind == "thinking":
-                    # Veškeré úvahy a reflexe jdou do PRAVÉHO panelu,
+                    # Veškeré úvahy jdou do PRAVÉHO HORNÍHO panelu,
                     # levý panel (výstup kódu) zůstává čistý.
                     if self.show_thinking.get():
                         if not self.thinking_seen:
@@ -1001,6 +1101,30 @@ class App:
                         self.status_var.set("Model přemýšlí…")
                     self.thinking_seen = True
 
+                elif kind == "reflection_hdr":
+                    # Hlavička reflexe – vždy zobrazíme (pokud je thinking zapnuté)
+                    if self.show_thinking.get():
+                        if not self.thinking_seen:
+                            self._append_thinking(
+                                "\n══ úvahy modelu / reflexe ══\n", tag="hdr"
+                            )
+                            self.thinking_seen = True
+                        self._append_thinking(payload, tag="refl_hdr")
+                        self._reflection_hdr_seen = True
+
+                elif kind == "reflection":
+                    # CELÝ text reflexe – nic se nezkracuje.
+                    if self.show_thinking.get():
+                        if not self.thinking_seen:
+                            self._append_thinking(
+                                "\n══ úvahy modelu / reflexe ══\n", tag="hdr"
+                            )
+                            self.thinking_seen = True
+                        self._append_thinking(payload, tag="refl")
+                    else:
+                        # i při vypnutém thinking zobrazíme alespoň status
+                        self.status_var.set("Probíhá reflexe kódu…")
+
                 elif kind == "status":
                     self.status_var.set(payload)
 
@@ -1011,6 +1135,8 @@ class App:
                     dr = payload.get("done_reason") if isinstance(payload, dict) else None
                     if dr:
                         self._last_done_reason = dr
+                    # okamžitě překreslit i panel statistik Ollamy
+                    self._update_ollama_stats(payload)
 
                 elif kind == "final_main_content":
                     # Uložíme hlavní obsah pro ukládání bloků (bez reflexí).
@@ -1080,6 +1206,8 @@ class App:
                                 "\n[Model dosáhl limitu délky odpovědi – "
                                 "můžete pokračovat tlačítkem „Pokračovat v generování“. ]\n",
                             )
+                    # finální překreslení statistik (s aktuálními totaly)
+                    self._update_ollama_stats(self.last_stats)
                     forced_stats = True
 
         except queue.Empty:
@@ -1124,11 +1252,126 @@ class App:
         self._tracker.feed(text)
 
     def _append_thinking(self, text: str, tag: str = "think"):
-        """Přidá text do pravého panelu (thinking / reflexe)."""
+        """Přidá text do pravého HORNÍHO panelu (thinking / reflexe)."""
         at_bottom = self.think_text.yview()[1] >= 0.999
         self.think_text.insert("end", text, tag)
         if at_bottom:
             self.think_text.see("end")
+
+    # -- statistiky výstupu Ollamy (PRAVÝ DOLNÍ PANEL) --------------------
+
+    @staticmethod
+    def _fmt_ns(ns) -> str:
+        """Naformátuje nanosekundy na rozumný lidský tvar."""
+        try:
+            ns = float(ns)
+        except (TypeError, ValueError):
+            return str(ns)
+        s = ns / 1e9
+        if s < 1:
+            return f"{s * 1000:.0f} ms"
+        if s < 60:
+            return f"{s:.2f} s"
+        m, rem = divmod(s, 60)
+        return f"{int(m)} m {rem:.1f} s"
+
+    def _update_ollama_stats(self, stats: dict):
+        """
+        Překreslí PRAVÝ DOLNÍ panel se statistikami výstupu Ollamy.
+        Volá se při každém příjmu 'stats' z workeru (throttlovaně) a při
+        'finished'. Vždy zobrazuje aktuální data (poslední odpověď + totaly).
+        """
+        w = self.ollama_stats_text
+        try:
+            w.configure(state="normal")
+            w.delete("1.0", "end")
+
+            g = stats if isinstance(stats, dict) else {}
+            t = self.totals
+
+            def kv(label: str, value, tag_val: str = "kv_val"):
+                w.insert("end", f"{label}: ", "kv_key")
+                w.insert("end", f"{value}\n", tag_val)
+
+            # ---- Poslední odpověď (raw Ollama stats) ----
+            w.insert("end", f"── Poslední odpověď ({time.strftime('%H:%M:%S')}) ──\n", "hdr")
+
+            if not g:
+                w.insert("end", "(zatím žádná data)\n", "sep")
+            else:
+                if "gen_s" in g:
+                    kv("Wall-clock čas", f"{float(g['gen_s']):.2f} s", "good")
+
+                if g.get("eval_count") is not None:
+                    kv("Tokeny odpovědi (eval_count)", g["eval_count"])
+
+                if g.get("eval_duration") is not None:
+                    kv("Doba generování (eval_duration)", self._fmt_ns(g["eval_duration"]))
+
+                tps = self._toks_per_s(g)
+                if tps:
+                    kv("Rychlost generování", f"{tps:.2f} tok/s", "good")
+
+                if g.get("prompt_eval_count") is not None:
+                    kv("Tokeny vstupu (prompt_eval_count)", g["prompt_eval_count"])
+
+                if g.get("prompt_eval_duration") is not None:
+                    kv("Zpracování vstupu", self._fmt_ns(g["prompt_eval_duration"]))
+
+                if g.get("load_duration") is not None:
+                    kv("Načtení modelu", self._fmt_ns(g["load_duration"]))
+
+                if g.get("total_duration") is not None:
+                    kv("Celková doba volání API", self._fmt_ns(g["total_duration"]))
+
+                if g.get("reflections") is not None:
+                    kv("Provedených reflexí", g["reflections"], "good")
+
+                if g.get("done_reason"):
+                    dr = str(g["done_reason"])
+                    tag = "good" if dr == "stop" else ("warn" if dr == "length" else "kv_val")
+                    kv("Důvod ukončení (done_reason)", dr, tag)
+
+            # ---- Celkem za relaci (souhrn) ----
+            w.insert("end", "\n── Celkem za relaci ──\n", "hdr")
+            kv("Odpovědí", t["replies"])
+            kv("Znaků odpovědí", t["reply_chars"])
+            kv("Celkový čas generování", f"{t['gen_s']:.1f} s")
+            kv("Tokeny odpovědí celkem", t["eval"])
+            kv("Vstupní tokeny celkem", t["prompt_eval"])
+            if t.get("reflections"):
+                kv("Reflexí celkem", t["reflections"])
+            if t["replies"] and t["gen_s"]:
+                kv(
+                    "Průměr na odpověď",
+                    f"{t['gen_s'] / t['replies']:.1f} s, "
+                    f"{t['eval'] / t['replies']:.0f} tokenů",
+                )
+
+            # ---- Běh ----
+            w.insert("end", "\n── Běh ──\n", "hdr")
+            kv("Model", self.model_var.get() or DEFAULT_MODEL)
+            kv("Server", self.host_var.get() or DEFAULT_HOST)
+            kv("num_predict", f"{GEN_OPTIONS.get('num_predict')}  (=-1 neomezeně)")
+            kv("num_ctx", f"{GEN_OPTIONS.get('num_ctx')} tokenů")
+            state = "běží" if (self.worker and self.worker.is_alive()) else "nečinný"
+            kv("Stav", state, "good" if state == "běží" else "kv_val")
+
+        finally:
+            w.configure(state="normal")
+
+    def _copy_ollama_stats(self):
+        content = self.ollama_stats_text.get("1.0", "end-1c")
+        if not content.strip():
+            self.status_var.set("Panel statistik Ollamy je prázdný.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(content)
+        self.status_var.set(f"Statistiky Ollamy zkopírovány: {len(content)} znaků.")
+
+    def _clear_ollama_stats(self):
+        self.ollama_stats_text.delete("1.0", "end")
+        self.status_var.set("Panel statistik Ollamy byl smazán.")
 
     # -- kopírování označeného textu --------------------------------------
 
@@ -1380,7 +1623,7 @@ class App:
             f"num_predict:  {GEN_OPTIONS.get('num_predict')} (=-1 neomezeně)",
             f"num_ctx:      {GEN_OPTIONS.get('num_ctx')} tokenů",
             f"Reflexe kódu: "
-            f"{'zapnuta, každých ' + str(self.reflect_every.get()) + ' řádků (zobrazuje se v pravém panelu)' if self.reflect_enabled.get() else 'vypnuta'}",
+            f"{'zapnuta, každých ' + str(self.reflect_every.get()) + ' řádků (zobrazuje se v pravém horním panelu)' if self.reflect_enabled.get() else 'vypnuta'}",
         ]
 
         messagebox.showinfo(
@@ -1396,6 +1639,7 @@ class App:
             return
         self.out_text.delete("1.0", "end")
         self.think_text.delete("1.0", "end")
+        self.ollama_stats_text.delete("1.0", "end")
         self.history.clear()
         self.reply_buf.clear()
         self.last_reply_text = ""
@@ -1407,8 +1651,10 @@ class App:
         self._last_done_reason = ""
         self._continuing = False
         self._reflection_count = 0
+        self._reflection_hdr_seen = False
         self.continue_btn.configure(state="disabled")
         self._refresh_stats()
+        self._update_ollama_stats({})
         self.status_var.set("Nový dialog – historie byla smazána.")
 
     def _save_output(self):
