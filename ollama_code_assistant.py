@@ -22,19 +22,23 @@ Dlouhé generování:
     num_predict / kontextu) umožní poslat modelu výzvu k pokračování
   - automatická detekce done_reason == "length" → upozornění v status baru
 
-Reflexe kódu (novinka):
+Reflexe kódu:
   - Volitelně lze zapnout „Reflexe kódu každých N řádků“.
   - Během psaní kódu aplikace po každých N řádcích zastaví stream, pošle
     modelu krátkou výzvu, aby se zamyslel nad možnými problémy v právě
     napsaném kódu (chyby, edge-cases, vylepšení), a pak automaticky
     pokračuje v generování se zohledněním této reflexe.
-  - Reflexe se zobrazují odlišeným stylem (tyrkysová kurzíva) a jsou
-    součástí historie dialogu, takže zvyšují kvalitu dalšího pokračování.
+  - Text reflexe se zobrazuje v PRAVÉM panelu (spolu s běžnými úvahami
+    modelu). Levý panel (výstup) zůstává čistý a obsahuje pouze kód.
+
+Dva panely:
+  - LEVÝ panel  = čistý výstup asistenta (kód, značky VSTUP/POKRAČOVÁNÍ, chyby)
+  - PRAVÝ panel = veškeré „thinking“ modelu a automatické reflexe kódu
 
 Ovládání:
   Ctrl+Enter   odešle požadavek (z pole Vstup)
-  Ctrl+C       zkopíruje označený text (funguje ve výstupu i ve vstupu)
-  Pravé tlačítko myši  kontextové menu
+  Ctrl+C       zkopíruje označený text (funguje ve výstupu, úvahách i ve vstupu)
+  Pravé tlačítko myši  kontextové menu (samostatné pro každý panel)
   Tlačítko     Zastavit přeruší běžící generování
   Tlačítko     Pokračovat v generování – pošle modelu výzvu k pokračování
 """
@@ -363,7 +367,8 @@ class App:
         self.user_stop = threading.Event()    # pouze uživatelský STOP
         self.worker: threading.Thread | None = None
         self.q: queue.SimpleQueue = queue.SimpleQueue()
-        self.show_thinking = tk.BooleanVar(value=False)
+        # výchozí stav: úvahy zapnuté (zobrazují se v pravém panelu)
+        self.show_thinking = tk.BooleanVar(value=True)
 
         # ukládání bloků kódu
         self.auto_save_code = tk.BooleanVar(value=True)
@@ -397,6 +402,9 @@ class App:
         self._reflective_active: bool = False
         self._got_final_history: bool = False
 
+        # příznak prvního „thinking“ v rámci jednoho běhu
+        self.thinking_seen = False
+
         self._build_ui()
         self._update_dir_label()
         self.root.after(self.POLL_MS, self._poll)
@@ -406,8 +414,8 @@ class App:
     def _build_ui(self):
         root = self.root
         root.title(f"Ollama kódový asistent – {DEFAULT_MODEL}")
-        root.geometry("1040x780")
-        root.minsize(720, 500)
+        root.geometry("1280x820")
+        root.minsize(900, 560)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         mono = tkfont.nametofont("TkFixedFont").copy()
@@ -482,8 +490,7 @@ class App:
 
         ttk.Label(
             bar3,
-            text="řádků (model se krátce zamyslí nad problémy v kódu, "
-                 "čímž zvýší kvalitu dalšího pokračování)",
+            text="řádků (reflexe se zobrazí v pravém panelu; levý výstup zůstává čistý)",
             foreground="#505050",
         ).pack(side="left")
 
@@ -496,9 +503,22 @@ class App:
         paned.add(top, weight=3)
         paned.add(bottom, weight=1)
 
-        ttk.Label(top, text="Výstup asistenta").pack(anchor="w", padx=2, pady=(0, 2))
+        # --- horizontální rozdělení: vlevo výstup, vpravo thinking/reflexe ---
+        h_paned = ttk.Panedwindow(top, orient="horizontal")
+        h_paned.pack(fill="both", expand=True)
+
+        left_frame = ttk.Frame(h_paned)
+        right_frame = ttk.Frame(h_paned)
+        h_paned.add(left_frame, weight=3)
+        h_paned.add(right_frame, weight=2)
+
+        # ---- LEVÝ PANEL: čistý výstup asistenta --------------------------
+        ttk.Label(
+            left_frame, text="Výstup asistenta (kód)"
+        ).pack(anchor="w", padx=2, pady=(0, 2))
+
         self.out_text = scrolledtext.ScrolledText(
-            top, wrap="none", font=mono, undo=False, state="normal"
+            left_frame, wrap="none", font=mono, undo=False, state="normal"
         )
         self.out_text.pack(fill="both", expand=True)
         self.out_text.tag_configure(
@@ -506,10 +526,6 @@ class App:
             foreground="#0b3d91", spacing3=4
         )
         self.out_text.tag_configure("bot", spacing1=1)
-        self.out_text.tag_configure(
-            "think", foreground="#8a8a8a",
-            font=("TkFixedFont", 10, "italic")
-        )
         self.out_text.tag_configure("err", foreground="#b00000")
         self.out_text.tag_configure(
             "sys", foreground="#606060", font=("TkFixedFont", 10, "italic")
@@ -517,23 +533,32 @@ class App:
         self.out_text.tag_configure(
             "cont", foreground="#006060", font=("TkFixedFont", 10, "italic")
         )
-        # Reflexe – výrazný tyrkysový blok
-        self.out_text.tag_configure(
-            "reflect", foreground="#006b6b",
-            font=("TkFixedFont", 10, "italic"),
-            background="#eaf6f6",
-            spacing1=2, spacing3=2, lmargin1=12, lmargin2=12,
-        )
-        self.out_text.tag_configure(
-            "reflect_head", foreground="#005050",
-            font=("TkFixedFont", 10, "bold italic"),
-            background="#d8efef",
-            spacing1=4, spacing3=2, lmargin1=6, lmargin2=6,
-        )
-
-        # Značka na konci – pomáhá udržet pozici i při velmi dlouhém výstupu
         self.out_text.mark_set("end_mark", "end-1c")
         self.out_text.mark_gravity("end_mark", "right")
+
+        # ---- PRAVÝ PANEL: úvahy modelu + reflexe ------------------------
+        ttk.Label(
+            right_frame,
+            text="Úvahy modelu (thinking) a reflexe kódu",
+            foreground="#505050",
+        ).pack(anchor="w", padx=2, pady=(0, 2))
+
+        self.think_text = scrolledtext.ScrolledText(
+            right_frame, wrap="word", font=mono, undo=False, state="normal"
+        )
+        self.think_text.pack(fill="both", expand=True)
+        self.think_text.tag_configure(
+            "think", foreground="#8a8a8a",
+            font=("TkFixedFont", 10, "italic")
+        )
+        self.think_text.tag_configure(
+            "refl", foreground="#306030",
+            font=("TkFixedFont", 10, "italic"), spacing1=2, spacing3=2
+        )
+        self.think_text.tag_configure(
+            "hdr", foreground="#404040",
+            font=("TkFixedFont", 10, "bold"), spacing1=6, spacing3=2
+        )
 
         # ---- statistika + kopírování (řádek pod textem) ------------------
         srow = ttk.Frame(top)
@@ -541,6 +566,12 @@ class App:
         self.stats_var = tk.StringVar(value="Statistika se zobrazí po první odpovědi.")
         ttk.Button(
             srow, text="Kopírovat označené", command=self._copy_selection
+        ).pack(side="right", padx=(6, 0))
+        ttk.Button(
+            srow, text="Kopírovat úvahy", command=self._copy_thinking
+        ).pack(side="right", padx=(6, 0))
+        ttk.Button(
+            srow, text="Smazat úvahy", command=self._clear_thinking
         ).pack(side="right", padx=(6, 0))
         ttk.Button(srow, text="Kopírovat výstup", command=self._copy_output).pack(
             side="right", padx=(6, 0)
@@ -600,11 +631,34 @@ class App:
         )
         self.in_menu.add_command(label="Odeslat    Ctrl+Enter", command=self._send)
 
-        for w in (self.out_text, self.in_text):
+        # menu pro pravý panel (úvahy)
+        self.think_menu = tk.Menu(root, tearoff=0)
+        self.think_menu.add_command(
+            label="Kopírovat označené    Ctrl+C",
+            command=lambda: self._copy_selection(self.think_text),
+        )
+        self.think_menu.add_command(
+            label="Označit vše",
+            command=lambda: self._select_all(self.think_text),
+        )
+        self.think_menu.add_separator()
+        self.think_menu.add_command(
+            label="Kopírovat celé úvahy",
+            command=self._copy_thinking,
+        )
+        self.think_menu.add_command(
+            label="Smazat panel úvah",
+            command=self._clear_thinking,
+        )
+
+        for w in (self.out_text, self.in_text, self.think_text):
             w.bind("<Control-c>", self._on_copy_key)
             w.bind("<Control-C>", self._on_copy_key)
         self.out_text.bind("<Button-3>", lambda e: self._popup(self.out_menu, e))
         self.in_text.bind("<Button-3>", lambda e: self._popup(self.in_menu, e))
+        self.think_text.bind(
+            "<Button-3>", lambda e: self._popup(self.think_menu, e)
+        )
 
         # ---- spodní lišta ------------------------------------------------
         foot = ttk.Frame(root, padding=(8, 5))
@@ -756,10 +810,11 @@ class App:
     def _run_reflective(self, host: str, model: str, messages):
         """
         Vícefázové generování:
-          1. Streamuj obsah, dokud neuplyne ~N řádků (počítáno podle \n).
+          1. Streamuj obsah, dokud neuplyne ~N řádků (počítáno podle \\n).
           2. Zastav stream, přidej vygenerovaný text jako assistant zprávu.
           3. Pošli modelu výzvu k reflexi (chyby, edge-cases, vylepšení).
-          4. Streamuj krátkou reflexi (zobrazí se odlišeným stylem).
+          4. Streamuj krátkou reflexi – ta jde do PRAVÉHO panelu (thinking),
+             levý výstup zůstává čistý.
           5. Přidej reflexi do historie a pošli pokyn k pokračování.
           6. Opakuj, dokud model sám neskončí nebo uživatel nezastaví.
         """
@@ -827,9 +882,12 @@ class App:
                     # Přirozený konec – model sám dokončil
                     break
 
-                # ---------- REFLEXNÍ FÁZE ----------
+                # ---------- REFLEXNÍ FÁZE (skrytá – jen do pravého panelu) ----------
                 self._reflection_count += 1
-                put(("reflection_start", self._reflection_count))
+                put(("thinking",
+                     f"\n── Reflexe č. {self._reflection_count} "
+                     f"(po {line_limit} řádcích) ──\n"))
+                put(("status", f"Reflexe kódu č. {self._reflection_count}…"))
 
                 reflect_prompt = REFLECT_PROMPT_TEMPLATE.format(n=line_limit)
                 conv.append({"role": "user", "content": reflect_prompt})
@@ -839,7 +897,8 @@ class App:
 
                 def on_refl(c):
                     refl_chars.append(c)
-                    put(("reflection", c))
+                    # Reflexe jde jako "thinking" – zobrazí se v pravém panelu.
+                    put(("thinking", c))
 
                 try:
                     client.stream(
@@ -854,8 +913,6 @@ class App:
                 reflection_text = "".join(refl_chars)
                 if reflection_text:
                     conv.append({"role": "assistant", "content": reflection_text})
-
-                put(("reflection_end", self._reflection_count))
 
                 if self.user_stop.is_set():
                     break
@@ -916,7 +973,6 @@ class App:
     def _poll(self):
         q_get = self.q.get_nowait
         chunk_buf: list[str] = []
-        refl_buf: list[str] = []
         forced_stats = False
 
         try:
@@ -927,41 +983,23 @@ class App:
                     chunk_buf.append(payload)
                     continue
 
-                if kind == "reflection":
-                    if chunk_buf:
-                        self._flush_chunks(chunk_buf)
-                        chunk_buf = []
-                    refl_buf.append(payload)
-                    continue
-
-                # vyprázdnit nasbírané buffery před zpracováním jiné zprávy
+                # vyprázdnit nasbírané chunky před zpracováním jiné zprávy
                 if chunk_buf:
                     self._flush_chunks(chunk_buf)
                     chunk_buf = []
-                if refl_buf:
-                    self._flush_reflection(refl_buf)
-                    refl_buf = []
 
                 if kind == "thinking":
+                    # Veškeré úvahy a reflexe jdou do PRAVÉHO panelu,
+                    # levý panel (výstup kódu) zůstává čistý.
                     if self.show_thinking.get():
                         if not self.thinking_seen:
-                            self._append("think", "\n— úvahy modelu —\n")
-                        self._append("think", payload)
+                            self._append_thinking(
+                                "\n══ úvahy modelu / reflexe ══\n", tag="hdr"
+                            )
+                        self._append_thinking(payload, tag="think")
                     elif not self.thinking_seen:
                         self.status_var.set("Model přemýšlí…")
                     self.thinking_seen = True
-
-                elif kind == "reflection_start":
-                    n = payload
-                    self._append(
-                        "reflect_head",
-                        f"\n◆ Reflexe kódu č. {n} — zamýšlím se nad kvalitou…\n",
-                    )
-                    self.status_var.set(f"Reflexe kódu č. {n}…")
-
-                elif kind == "reflection_end":
-                    self._append("reflect_head", "\n— konec reflexe —\n\n")
-                    self.status_var.set("Pokračuji v generování…")
 
                 elif kind == "status":
                     self.status_var.set(payload)
@@ -1049,13 +1087,11 @@ class App:
 
         if chunk_buf:
             self._flush_chunks(chunk_buf)
-        if refl_buf:
-            self._flush_reflection(refl_buf)
 
         # --- throttlovaný refresh statistik ---
         now = time.monotonic()
         if forced_stats or (
-            (chunk_buf or refl_buf)
+            chunk_buf
             and now - self._last_stats_update >= self.STATS_THROTTLE
         ):
             self._refresh_stats()
@@ -1078,16 +1114,6 @@ class App:
         if not self._reflective_active:
             self.status_var.set("Generuji odpověď…")
 
-    def _flush_reflection(self, chunks: list[str]):
-        """Vloží nasbírané chunk(y) reflexe odlišeným stylem."""
-        text = "".join(chunks)
-        at_bottom = self.out_text.yview()[1] >= 0.999
-        self.out_text.insert("end", text, "reflect")
-        if at_bottom:
-            self.out_text.mark_set("insert", "end-1c")
-            self.out_text.see("end")
-        self._tracker.feed(text)
-
     # -- pomocné akce ------------------------------------------------------
 
     def _append(self, tag: str, text: str):
@@ -1096,6 +1122,13 @@ class App:
         if at_bottom:
             self.out_text.see("end")
         self._tracker.feed(text)
+
+    def _append_thinking(self, text: str, tag: str = "think"):
+        """Přidá text do pravého panelu (thinking / reflexe)."""
+        at_bottom = self.think_text.yview()[1] >= 0.999
+        self.think_text.insert("end", text, tag)
+        if at_bottom:
+            self.think_text.see("end")
 
     # -- kopírování označeného textu --------------------------------------
 
@@ -1126,6 +1159,24 @@ class App:
         self.status_var.set(
             f"Zkopírováno označené: {len(sel)} znaků, {len(sel.split())} slov."
         )
+
+    def _copy_output(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.out_text.get("1.0", "end-1c"))
+        self.status_var.set("Výstup zkopírován do schránky.")
+
+    def _copy_thinking(self):
+        content = self.think_text.get("1.0", "end-1c")
+        if not content.strip():
+            self.status_var.set("Panel úvah je prázdný.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(content)
+        self.status_var.set(f"Úvahy zkopírovány: {len(content)} znaků.")
+
+    def _clear_thinking(self):
+        self.think_text.delete("1.0", "end")
+        self.status_var.set("Panel úvah byl smazán.")
 
     @staticmethod
     def _select_all(widget: tk.Text):
@@ -1329,7 +1380,7 @@ class App:
             f"num_predict:  {GEN_OPTIONS.get('num_predict')} (=-1 neomezeně)",
             f"num_ctx:      {GEN_OPTIONS.get('num_ctx')} tokenů",
             f"Reflexe kódu: "
-            f"{'zapnuta, každých ' + str(self.reflect_every.get()) + ' řádků' if self.reflect_enabled.get() else 'vypnuta'}",
+            f"{'zapnuta, každých ' + str(self.reflect_every.get()) + ' řádků (zobrazuje se v pravém panelu)' if self.reflect_enabled.get() else 'vypnuta'}",
         ]
 
         messagebox.showinfo(
@@ -1344,6 +1395,7 @@ class App:
         ):
             return
         self.out_text.delete("1.0", "end")
+        self.think_text.delete("1.0", "end")
         self.history.clear()
         self.reply_buf.clear()
         self.last_reply_text = ""
@@ -1359,11 +1411,6 @@ class App:
         self._refresh_stats()
         self.status_var.set("Nový dialog – historie byla smazána.")
 
-    def _copy_output(self):
-        self.root.clipboard_clear()
-        self.root.clipboard_append(self.out_text.get("1.0", "end-1c"))
-        self.status_var.set("Výstup zkopírován do schránky.")
-
     def _save_output(self):
         path = filedialog.asksaveasfilename(
             parent=self.root,
@@ -1376,7 +1423,18 @@ class App:
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(self.out_text.get("1.0", "end-1c"))
-            self.status_var.set(f"Uloženo: {path}")
+            # vedle výstupu uložit i úvahy (pokud nějaké jsou)
+            think = self.think_text.get("1.0", "end-1c")
+            if think.strip():
+                root_path, ext = os.path.splitext(path)
+                think_path = f"{root_path}_thinking{ext or '.md'}"
+                with open(think_path, "w", encoding="utf-8") as f:
+                    f.write(think)
+                self.status_var.set(
+                    f"Uloženo: {path}  (+ úvahy: {os.path.basename(think_path)})"
+                )
+            else:
+                self.status_var.set(f"Uloženo: {path}")
         except OSError as e:
             messagebox.showerror("Chyba ukládání", str(e), parent=self.root)
 
